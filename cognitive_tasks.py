@@ -1,537 +1,760 @@
+#!/usr/bin/env python3
 """
-Cognitive Tasks for Brain-Inspired RNN Evaluation
-==================================================
+Cognitive Tasks Module for Brain-Inspired RNN Framework
+========================================================
 
-This module implements the cognitive tasks from Ji-An et al. 
-"Discovering cognitive strategies with tiny recurrent neural networks"
+This module implements cognitive tasks used to train and evaluate
+brain-inspired RNNs with developmental constraints.
 
-Tasks Implemented:
-1. Reversal Learning Task - Animal learns which action yields reward, 
-   with occasional reversals
-2. Two-Stage Task - Hierarchical decision-making with probabilistic 
-   state transitions
-3. Probabilistic Reward Task - Continuous learning with volatile 
-   reward probabilities
+Tasks Implemented
+-----------------
+1. Reversal Learning Task
+   - Binary choice with probabilistic rewards
+   - Contingency reversals test adaptation
+   
+2. Two-Stage Task (Daw et al., 2011)
+   - Dissociates model-based vs model-free learning
+   - Stage 1: choice -> transition -> Stage 2 state
+   - Stage 2: probabilistic reward
+   
+3. Probabilistic Reward Task
+   - Volatile reward probabilities
+   - Tests learning rate and uncertainty tracking
 
-Each task provides:
-- Trial generation with proper structure
-- Reward computation
-- Performance metrics
-- Optimal/Bayesian agent baselines
+Input Encoding
+--------------
+Following Ji-An et al. (2025), inputs encode previous trial information:
+    x_t = [a_{t-1}, s_{t-1}, r_{t-1}]
+    
+where:
+    - a_{t-1}: Previous action (0 or 1)
+    - s_{t-1}: Previous state (task-specific)
+    - r_{t-1}: Previous reward (0 or 1)
 
-Mathematical Framework:
------------------------
-For the reversal learning task, the optimal policy follows:
-    P(correct) = σ(β * [V(correct) - V(incorrect)])
+One-Hot Encoding
+----------------
+For switching models (SLIN), inputs are one-hot encoded:
+    - Reversal: 4 conditions (2 actions x 2 rewards)
+    - Two-stage: 8 conditions (2 actions x 2 states x 2 rewards)
 
-where V evolves according to:
-    V(a) ← V(a) + α * (r - V(a))
+Reference
+---------
+Ji-An et al. "Discovering cognitive strategies with tiny recurrent neural networks"
+Nature (2025)
 
-For the two-stage task:
-    Action A₁ or A₂ → State S₁ or S₂ (probabilistic transition)
-    Then receive reward with P(reward|state)
+Author: Computational Neuroscience Research
 """
 
 import numpy as np
 import torch
-from typing import Tuple, Dict, List, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Union
+from dataclasses import dataclass, field
 from enum import Enum
-import warnings
 
 
-class TaskType(Enum):
-    """Enumeration of available task types."""
-    REVERSAL_LEARNING = "reversal"
-    TWO_STAGE = "two_stage"
-    PROBABILISTIC_REWARD = "probabilistic"
-
+# =============================================================================
+# Data Structures
+# =============================================================================
 
 @dataclass
 class TrialData:
     """
-    Container for trial data in cognitive tasks.
+    Container for single trial data.
     
-    Attributes:
-        inputs: Input features for each trial [n_trials, input_dim]
-        targets: Target actions/values [n_trials, output_dim]
-        rewards: Rewards received [n_trials]
-        actions: Actions taken [n_trials]
-        states: Hidden states (for two-stage task) [n_trials]
-        trial_info: Dictionary with additional trial information
+    Attributes
+    ----------
+    action : int
+        Chosen action (0 or 1)
+    state : int
+        Current state
+    reward : float
+        Received reward
+    optimal_action : int
+        Optimal action for this trial
+    """
+    action: int
+    state: int
+    reward: float
+    optimal_action: int
+
+
+@dataclass
+class SessionData:
+    """
+    Container for a complete session of trials.
+    
+    Attributes
+    ----------
+    inputs : np.ndarray
+        Input sequences, shape [n_trials, input_dim]
+    targets : np.ndarray
+        Target probabilities, shape [n_trials, output_dim]
+    actions : np.ndarray
+        Action sequence
+    rewards : np.ndarray
+        Reward sequence
+    states : np.ndarray
+        State sequence
+    trial_info : Dict
+        Additional trial information (reversals, transitions, etc.)
     """
     inputs: np.ndarray
     targets: np.ndarray
-    rewards: np.ndarray
     actions: np.ndarray
-    states: Optional[np.ndarray] = None
-    trial_info: Optional[Dict] = None
+    rewards: np.ndarray
+    states: np.ndarray
+    trial_info: Dict = field(default_factory=dict)
 
+
+class TaskType(Enum):
+    """Enumeration of available task types."""
+    REVERSAL_LEARNING = "reversal_learning"
+    TWO_STAGE = "two_stage"
+    PROBABILISTIC_REWARD = "probabilistic_reward"
+
+
+# =============================================================================
+# Reversal Learning Task
+# =============================================================================
 
 class ReversalLearningTask:
     """
-    Reversal Learning Task.
+    Reversal learning task with probabilistic rewards.
     
-    In this task, the agent chooses between two actions (A₁, A₂).
-    One action (correct) yields reward with high probability (e.g., 0.8),
-    while the other yields reward with low probability (e.g., 0.2).
+    The agent chooses between two actions. One action has higher
+    reward probability (e.g., 0.8 vs 0.2). Periodically, the
+    contingencies reverse.
     
-    Periodically (every ~30-50 trials), the contingencies reverse:
-    the previously correct action becomes incorrect and vice versa.
+    Parameters
+    ----------
+    reward_probs : Tuple[float, float]
+        Reward probabilities for (better, worse) option
+    min_trials_before_reversal : int
+        Minimum trials before reversal can occur
+    reversal_prob : float
+        Probability of reversal after minimum trials
     
-    This task probes:
-    - Learning rate adaptation
-    - Flexibility/reversal learning
-    - Exploitation vs exploration
+    Attributes
+    ----------
+    input_dim : int
+        Input dimension (3: action, state, reward)
+    output_dim : int
+        Output dimension (2: action probabilities)
+    n_onehot : int
+        Number of one-hot conditions (4)
     
-    Input encoding (per trial):
-        [previous_action, previous_second_stage, previous_reward]
-        = [a_{t-1}, s_{t-1}, r_{t-1}]
-    
-    Output:
-        P(A₁) via softmax over [logit_A1, logit_A2]
+    Examples
+    --------
+    >>> task = ReversalLearningTask()
+    >>> session = task.generate_session(100, seed=42)
+    >>> print(session.inputs.shape)  # (100, 3)
     """
     
-    def __init__(self, 
-                 reward_prob_high: float = 0.8,
-                 reward_prob_low: float = 0.2,
-                 reversal_prob: float = 0.03,
-                 min_trials_before_reversal: int = 20):
-        """
-        Initialize the reversal learning task.
-        
-        Args:
-            reward_prob_high: P(reward|correct action)
-            reward_prob_low: P(reward|incorrect action)
-            reversal_prob: Probability of reversal on each trial (after min)
-            min_trials_before_reversal: Minimum trials between reversals
-        """
-        self.reward_prob_high = reward_prob_high
-        self.reward_prob_low = reward_prob_low
-        self.reversal_prob = reversal_prob
+    def __init__(
+        self,
+        reward_probs: Tuple[float, float] = (0.8, 0.2),
+        min_trials_before_reversal: int = 20,
+        reversal_prob: float = 0.03
+    ):
+        self.reward_probs = reward_probs
         self.min_trials_before_reversal = min_trials_before_reversal
+        self.reversal_prob = reversal_prob
         
-        self.input_dim = 3   # [previous_action, previous_state, previous_reward]
-        self.output_dim = 2  # [logit_A1, logit_A2]
-        
-    def generate_session(self, n_trials: int, seed: Optional[int] = None) -> TrialData:
+        # Dimensions
+        self.input_dim = 3  # [a_{t-1}, s_{t-1}, r_{t-1}]
+        self.output_dim = 2  # P(A1), P(A2)
+        self.n_onehot = 4  # 2 actions x 2 rewards
+    
+    def generate_session(
+        self,
+        n_trials: int,
+        seed: Optional[int] = None
+    ) -> SessionData:
         """
         Generate a session of reversal learning trials.
         
-        Args:
-            n_trials: Number of trials in the session
-            seed: Random seed for reproducibility
+        Parameters
+        ----------
+        n_trials : int
+            Number of trials
+        seed : int, optional
+            Random seed
         
-        Returns:
-            TrialData containing inputs, targets, rewards, actions
+        Returns
+        -------
+        SessionData
+            Complete session data
         """
         if seed is not None:
             np.random.seed(seed)
         
-        # Track which action is currently correct (0 or 1)
-        correct_action = 0
-        trials_since_reversal = 0
-        
-        # Storage
+        # Initialize
         inputs = np.zeros((n_trials, self.input_dim))
         targets = np.zeros((n_trials, self.output_dim))
-        rewards = np.zeros(n_trials)
         actions = np.zeros(n_trials, dtype=int)
+        rewards = np.zeros(n_trials)
+        states = np.zeros(n_trials, dtype=int)
+        
+        # Track contingency
+        better_action = 0
+        trials_since_reversal = 0
         reversal_trials = []
         
-        # Initialize first trial inputs (no history)
-        inputs[0, :] = [0.5, 0.5, 0.5]  # Neutral initialization
-        
         for t in range(n_trials):
-            # Set target based on current correct action
-            targets[t, correct_action] = 1.0
-            targets[t, 1 - correct_action] = 0.0
+            # Set input from previous trial
+            if t > 0:
+                inputs[t] = [actions[t-1], states[t-1], rewards[t-1]]
             
-            # Agent chooses action (for data generation, use slight bias toward correct)
-            if t == 0:
-                action = np.random.randint(2)
+            # Set target (optimal policy)
+            targets[t, better_action] = 1.0
+            
+            # Simulate action (epsilon-greedy for data generation)
+            if np.random.random() < 0.1:
+                actions[t] = np.random.randint(2)
             else:
-                # Generate action with some exploration noise
-                p_correct = 0.7  # Simulated agent slightly favors correct
-                action = correct_action if np.random.random() < p_correct else (1 - correct_action)
+                actions[t] = better_action
             
-            actions[t] = action
-            
-            # Determine reward
-            if action == correct_action:
-                reward = 1.0 if np.random.random() < self.reward_prob_high else 0.0
+            # Generate reward
+            if actions[t] == better_action:
+                rewards[t] = float(np.random.random() < self.reward_probs[0])
             else:
-                reward = 1.0 if np.random.random() < self.reward_prob_low else 0.0
-            
-            rewards[t] = reward
-            
-            # Set inputs for next trial
-            if t < n_trials - 1:
-                inputs[t + 1, 0] = action  # Previous action (0 or 1)
-                inputs[t + 1, 1] = 0.5     # No second stage in this task
-                inputs[t + 1, 2] = reward  # Previous reward
+                rewards[t] = float(np.random.random() < self.reward_probs[1])
             
             # Check for reversal
             trials_since_reversal += 1
             if trials_since_reversal >= self.min_trials_before_reversal:
                 if np.random.random() < self.reversal_prob:
-                    correct_action = 1 - correct_action
+                    better_action = 1 - better_action
                     reversal_trials.append(t)
                     trials_since_reversal = 0
         
-        return TrialData(
+        return SessionData(
             inputs=inputs,
             targets=targets,
-            rewards=rewards,
             actions=actions,
-            trial_info={'reversal_trials': reversal_trials, 'task': 'reversal'}
+            rewards=rewards,
+            states=states,
+            trial_info={'reversal_trials': reversal_trials}
         )
     
-    def compute_optimal_policy(self, session: TrialData, 
-                               learning_rate: float = 0.3,
-                               inverse_temp: float = 5.0) -> np.ndarray:
+    def get_onehot_inputs(self, session: SessionData) -> np.ndarray:
         """
-        Compute optimal Rescorla-Wagner Q-learning policy.
+        Convert session inputs to one-hot encoding.
         
-        Updates Q-values according to:
-            Q(a) ← Q(a) + α * (r - Q(a))
+        One-hot index = 2 * action + reward
         
-        Action selection:
-            P(a) = softmax(β * Q(a))
+        Parameters
+        ----------
+        session : SessionData
+            Session data
         
-        Args:
-            session: Trial data
-            learning_rate: α parameter
-            inverse_temp: β parameter (inverse temperature)
-        
-        Returns:
-            Array of P(A₁) for each trial [n_trials]
+        Returns
+        -------
+        np.ndarray
+            One-hot encoded inputs, shape [n_trials, 4]
         """
-        n_trials = len(session.rewards)
-        Q = np.array([0.5, 0.5])  # Initial Q-values
-        policy = np.zeros(n_trials)
+        n_trials = len(session.actions)
+        onehot = np.zeros((n_trials, self.n_onehot))
+        
+        for t in range(1, n_trials):
+            idx = int(2 * session.actions[t-1] + session.rewards[t-1])
+            onehot[t, idx] = 1.0
+        
+        return onehot
+    
+    def compute_optimal_policy(
+        self,
+        session: SessionData,
+        learning_rate: float = 0.3
+    ) -> np.ndarray:
+        """
+        Compute optimal policy using simple Q-learning.
+        
+        Parameters
+        ----------
+        session : SessionData
+            Session data
+        learning_rate : float
+            Learning rate for Q-learning
+        
+        Returns
+        -------
+        np.ndarray
+            Optimal action probabilities, shape [n_trials, 2]
+        """
+        n_trials = len(session.actions)
+        Q = np.array([0.5, 0.5])
+        policy = np.zeros((n_trials, 2))
         
         for t in range(n_trials):
             # Softmax policy
-            exp_Q = np.exp(inverse_temp * Q)
-            policy[t] = exp_Q[0] / exp_Q.sum()
+            exp_Q = np.exp(5 * Q)
+            policy[t] = exp_Q / exp_Q.sum()
             
-            # Update Q-value for chosen action
-            a = session.actions[t]
-            r = session.rewards[t]
-            Q[a] += learning_rate * (r - Q[a])
+            # Update Q-values
+            if t > 0:
+                a = session.actions[t-1]
+                r = session.rewards[t-1]
+                Q[a] += learning_rate * (r - Q[a])
         
         return policy
 
 
+# =============================================================================
+# Two-Stage Task
+# =============================================================================
+
 class TwoStageTask:
     """
-    Two-Stage Decision Task.
+    Two-stage Markov decision task (Daw et al., 2011).
     
-    This task involves hierarchical decision-making:
+    Stage 1: Choose A1 or A2
+    Transition: Common (0.7) or rare (0.3) to Stage 2 state
+    Stage 2: Receive probabilistic reward
     
-    Stage 1: Choose action A₁ or A₂
-    Stage 2: Transition to state S₁ or S₂
-        - A₁ → S₁ with probability p, S₂ with probability 1-p (common transition)
-        - A₂ → S₂ with probability p, S₁ with probability 1-p (common transition)
-    Reward: Each state has its own reward probability that drifts over time
+    This task dissociates model-based and model-free learning:
+    - Model-free: Stay after reward regardless of transition
+    - Model-based: Account for transition structure
     
-    This task dissociates:
-    - Model-free learning (direct action-reward association)
-    - Model-based learning (learning transition structure)
+    Parameters
+    ----------
+    common_prob : float
+        Common transition probability
+    reward_drift_sd : float
+        Standard deviation of reward probability drift
     
-    A model-based agent should show:
-        P(stay|rewarded, rare) < P(stay|rewarded, common)
-    
-    A model-free agent shows:
-        P(stay|rewarded) > P(stay|unrewarded) regardless of transition type
-    
-    Input encoding:
-        [previous_action, previous_state, previous_reward]
-    
-    Output:
-        [logit_A1, logit_A2] for Stage 1 choice
+    Attributes
+    ----------
+    input_dim : int
+        Input dimension (3)
+    output_dim : int
+        Output dimension (2)
+    n_onehot : int
+        Number of one-hot conditions (8)
     """
     
-    def __init__(self,
-                 common_prob: float = 0.8,
-                 reward_drift: float = 0.025,
-                 reward_bounds: Tuple[float, float] = (0.25, 0.75)):
-        """
-        Initialize the two-stage task.
-        
-        Args:
-            common_prob: Probability of common transition
-            reward_drift: Standard deviation of reward probability drift
-            reward_bounds: Min and max reward probabilities
-        """
+    def __init__(
+        self,
+        common_prob: float = 0.7,
+        reward_drift_sd: float = 0.025
+    ):
         self.common_prob = common_prob
-        self.reward_drift = reward_drift
-        self.reward_bounds = reward_bounds
+        self.reward_drift_sd = reward_drift_sd
         
+        # Dimensions
         self.input_dim = 3
         self.output_dim = 2
+        self.n_onehot = 8  # 2 actions x 2 states x 2 rewards
     
-    def generate_session(self, n_trials: int, seed: Optional[int] = None) -> TrialData:
+    def generate_session(
+        self,
+        n_trials: int,
+        seed: Optional[int] = None
+    ) -> SessionData:
         """
         Generate a session of two-stage task trials.
         
-        Args:
-            n_trials: Number of trials
-            seed: Random seed
+        Parameters
+        ----------
+        n_trials : int
+            Number of trials
+        seed : int, optional
+            Random seed
         
-        Returns:
-            TrialData with full trial information
+        Returns
+        -------
+        SessionData
+            Complete session data
         """
         if seed is not None:
             np.random.seed(seed)
         
-        # Reward probabilities for each state (drift over time)
-        reward_probs = np.zeros((n_trials, 2))
-        reward_probs[0, :] = [0.5, 0.5]
+        # Initialize reward probabilities with random walk
+        reward_probs = np.array([0.5, 0.5])  # For state 0 and state 1
         
         # Storage
         inputs = np.zeros((n_trials, self.input_dim))
         targets = np.zeros((n_trials, self.output_dim))
+        actions = np.zeros(n_trials, dtype=int)
         rewards = np.zeros(n_trials)
-        actions = np.zeros(n_trials, dtype=int)  # Stage 1 action
-        states = np.zeros(n_trials, dtype=int)   # Stage 2 state
+        states = np.zeros(n_trials, dtype=int)
         transitions = np.zeros(n_trials, dtype=int)  # 0=common, 1=rare
         
-        inputs[0, :] = [0.5, 0.5, 0.5]  # Neutral initialization
-        
         for t in range(n_trials):
-            # Update reward probabilities with drift
+            # Set input from previous trial
             if t > 0:
-                drift = np.random.randn(2) * self.reward_drift
-                reward_probs[t, :] = np.clip(
-                    reward_probs[t-1, :] + drift,
-                    self.reward_bounds[0],
-                    self.reward_bounds[1]
-                )
+                inputs[t] = [actions[t-1], states[t-1], rewards[t-1]]
             
-            # Target: optimal action based on current reward probs and transitions
-            # Simplified: favor action leading to higher reward state
-            expected_values = np.zeros(2)
-            for a in range(2):
-                # Expected value = p(common)*V(common_state) + p(rare)*V(rare_state)
-                common_state = a  # A₁→S₁ common, A₂→S₂ common
-                rare_state = 1 - a
-                expected_values[a] = (self.common_prob * reward_probs[t, common_state] + 
-                                     (1-self.common_prob) * reward_probs[t, rare_state])
+            # Random action for data generation
+            actions[t] = np.random.randint(2)
             
-            targets[t, :] = expected_values / expected_values.sum()
-            
-            # Agent action (with exploration)
-            if np.random.random() < 0.3:  # Exploration
-                action = np.random.randint(2)
-            else:
-                action = np.argmax(expected_values)
-            
-            actions[t] = action
-            
-            # Stage 2: Determine state based on transition
-            common_state = action
+            # Transition
             is_common = np.random.random() < self.common_prob
             transitions[t] = 0 if is_common else 1
-            state = common_state if is_common else (1 - common_state)
-            states[t] = state
             
-            # Determine reward
-            reward = 1.0 if np.random.random() < reward_probs[t, state] else 0.0
-            rewards[t] = reward
+            if is_common:
+                states[t] = actions[t]  # A1->S1, A2->S2
+            else:
+                states[t] = 1 - actions[t]  # A1->S2, A2->S1
             
-            # Set inputs for next trial
-            if t < n_trials - 1:
-                inputs[t + 1, 0] = action
-                inputs[t + 1, 1] = state
-                inputs[t + 1, 2] = reward
+            # Reward
+            rewards[t] = float(np.random.random() < reward_probs[states[t]])
+            
+            # Drift reward probabilities
+            reward_probs += np.random.randn(2) * self.reward_drift_sd
+            reward_probs = np.clip(reward_probs, 0.25, 0.75)
+            
+            # Target: uniform for now (actual optimal policy is complex)
+            targets[t] = [0.5, 0.5]
         
-        return TrialData(
+        return SessionData(
             inputs=inputs,
             targets=targets,
-            rewards=rewards,
             actions=actions,
+            rewards=rewards,
             states=states,
-            trial_info={
-                'transitions': transitions,
-                'reward_probs': reward_probs,
-                'task': 'two_stage'
-            }
+            trial_info={'transitions': transitions}
         )
     
-    def compute_stay_probabilities(self, session: TrialData) -> Dict[str, float]:
+    def get_onehot_inputs(self, session: SessionData) -> np.ndarray:
         """
-        Compute stay probabilities conditioned on reward and transition type.
+        Convert to one-hot encoding.
         
-        Key behavioral signatures:
-        - Model-free: P(stay|rewarded) > P(stay|unrewarded)
-        - Model-based: interaction effect with transition type
+        Index = 4*action + 2*state + reward
         
-        Returns:
-            Dictionary with stay probabilities for each condition
+        Parameters
+        ----------
+        session : SessionData
+            Session data
+        
+        Returns
+        -------
+        np.ndarray
+            One-hot encoded inputs, shape [n_trials, 8]
         """
-        n_trials = len(session.rewards)
-        transitions = session.trial_info['transitions']
+        n_trials = len(session.actions)
+        onehot = np.zeros((n_trials, self.n_onehot))
         
-        # Count stays by condition
+        for t in range(1, n_trials):
+            idx = int(
+                4 * session.actions[t-1] + 
+                2 * session.states[t-1] + 
+                session.rewards[t-1]
+            )
+            onehot[t, idx] = 1.0
+        
+        return onehot
+    
+    def compute_stay_probabilities(
+        self,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        transitions: np.ndarray
+    ) -> Dict[str, float]:
+        """
+        Compute stay probabilities for each condition.
+        
+        Parameters
+        ----------
+        actions : np.ndarray
+            Action sequence
+        rewards : np.ndarray
+            Reward sequence
+        transitions : np.ndarray
+            Transition type (0=common, 1=rare)
+        
+        Returns
+        -------
+        Dict[str, float]
+            Stay probabilities for each condition
+        """
         conditions = {
-            'common_rewarded': {'stay': 0, 'total': 0},
-            'common_unrewarded': {'stay': 0, 'total': 0},
-            'rare_rewarded': {'stay': 0, 'total': 0},
-            'rare_unrewarded': {'stay': 0, 'total': 0}
+            'common_rewarded': [],
+            'common_unrewarded': [],
+            'rare_rewarded': [],
+            'rare_unrewarded': []
         }
         
-        for t in range(n_trials - 1):
+        for t in range(len(actions) - 1):
             is_common = transitions[t] == 0
-            is_rewarded = session.rewards[t] > 0
-            is_stay = session.actions[t] == session.actions[t + 1]
+            is_rewarded = rewards[t] > 0
+            is_stay = actions[t] == actions[t + 1]
             
-            if is_common and is_rewarded:
-                key = 'common_rewarded'
-            elif is_common and not is_rewarded:
-                key = 'common_unrewarded'
-            elif not is_common and is_rewarded:
-                key = 'rare_rewarded'
-            else:
-                key = 'rare_unrewarded'
-            
-            conditions[key]['total'] += 1
-            if is_stay:
-                conditions[key]['stay'] += 1
+            key = f"{'common' if is_common else 'rare'}_{'rewarded' if is_rewarded else 'unrewarded'}"
+            conditions[key].append(int(is_stay))
         
-        # Compute probabilities
-        probs = {}
-        for key, counts in conditions.items():
-            if counts['total'] > 0:
-                probs[key] = counts['stay'] / counts['total']
-            else:
-                probs[key] = 0.5
+        return {k: np.mean(v) if v else 0.5 for k, v in conditions.items()}
+    
+    def compute_mb_mf_indices(
+        self,
+        stay_probs: Dict[str, float]
+    ) -> Tuple[float, float]:
+        """
+        Compute model-based and model-free indices.
         
-        return probs
+        Parameters
+        ----------
+        stay_probs : Dict[str, float]
+            Stay probabilities from compute_stay_probabilities
+        
+        Returns
+        -------
+        Tuple[float, float]
+            (model_free_index, model_based_index)
+        
+        Notes
+        -----
+        MF index = mean reward effect = P(stay|rew) - P(stay|no_rew)
+        MB index = interaction = (common_rew - common_no) - (rare_rew - rare_no)
+        """
+        # Model-free: main effect of reward
+        mf_common = stay_probs['common_rewarded'] - stay_probs['common_unrewarded']
+        mf_rare = stay_probs['rare_rewarded'] - stay_probs['rare_unrewarded']
+        model_free_index = (mf_common + mf_rare) / 2
+        
+        # Model-based: interaction effect
+        model_based_index = mf_common - mf_rare
+        
+        return model_free_index, model_based_index
 
+
+# =============================================================================
+# Probabilistic Reward Task
+# =============================================================================
 
 class ProbabilisticRewardTask:
     """
-    Probabilistic Reward Learning Task.
+    Simple probabilistic reward task with volatile probabilities.
     
-    A simpler task where the agent learns volatile reward probabilities
-    for two actions. The reward probabilities change over time following
-    a random walk, requiring continuous adaptation.
+    Parameters
+    ----------
+    volatility : float
+        Rate of reward probability change
     
-    This task is useful for:
-    - Measuring learning rate
-    - Testing adaptation to volatility
-    - Comparing developmental differences in flexibility
-    
-    Input:
-        [previous_action, 0, previous_reward]
-    
-    Output:
-        [P(A₁), P(A₂)] (softmax over logits)
+    Attributes
+    ----------
+    input_dim : int
+        Input dimension (3)
+    output_dim : int
+        Output dimension (2)
     """
     
-    def __init__(self,
-                 initial_probs: Tuple[float, float] = (0.7, 0.3),
-                 volatility: float = 0.02,
-                 prob_bounds: Tuple[float, float] = (0.2, 0.8)):
-        """
-        Initialize the probabilistic reward task.
-        
-        Args:
-            initial_probs: Initial reward probabilities for each action
-            volatility: Standard deviation of probability drift
-            prob_bounds: Bounds on reward probabilities
-        """
-        self.initial_probs = initial_probs
+    def __init__(self, volatility: float = 0.02):
         self.volatility = volatility
-        self.prob_bounds = prob_bounds
-        
         self.input_dim = 3
         self.output_dim = 2
+        self.n_onehot = 4
     
-    def generate_session(self, n_trials: int, seed: Optional[int] = None) -> TrialData:
+    def generate_session(
+        self,
+        n_trials: int,
+        seed: Optional[int] = None
+    ) -> SessionData:
         """
         Generate a session of probabilistic reward trials.
+        
+        Parameters
+        ----------
+        n_trials : int
+            Number of trials
+        seed : int, optional
+            Random seed
+        
+        Returns
+        -------
+        SessionData
+            Complete session data
         """
         if seed is not None:
             np.random.seed(seed)
         
-        # Evolving reward probabilities
-        reward_probs = np.zeros((n_trials, 2))
-        reward_probs[0, :] = self.initial_probs
-        
+        # Initialize
         inputs = np.zeros((n_trials, self.input_dim))
         targets = np.zeros((n_trials, self.output_dim))
-        rewards = np.zeros(n_trials)
         actions = np.zeros(n_trials, dtype=int)
+        rewards = np.zeros(n_trials)
+        states = np.zeros(n_trials, dtype=int)
         
-        inputs[0, :] = [0.5, 0.0, 0.5]
+        # Reward probabilities for each action
+        reward_probs = np.array([0.6, 0.4])
         
         for t in range(n_trials):
-            # Update probabilities with drift
             if t > 0:
-                drift = np.random.randn(2) * self.volatility
-                reward_probs[t, :] = np.clip(
-                    reward_probs[t-1, :] + drift,
-                    self.prob_bounds[0],
-                    self.prob_bounds[1]
-                )
+                inputs[t] = [actions[t-1], states[t-1], rewards[t-1]]
             
-            # Target: favor action with higher reward probability
-            targets[t, :] = reward_probs[t, :] / reward_probs[t, :].sum()
+            # Target: optimal action
+            targets[t, np.argmax(reward_probs)] = 1.0
             
-            # Agent action (softmax with exploration)
-            probs = np.exp(3 * reward_probs[t, :])
-            probs = probs / probs.sum()
-            action = np.random.choice(2, p=probs)
-            actions[t] = action
+            # Random action
+            actions[t] = np.random.randint(2)
             
             # Reward
-            reward = 1.0 if np.random.random() < reward_probs[t, action] else 0.0
-            rewards[t] = reward
+            rewards[t] = float(np.random.random() < reward_probs[actions[t]])
             
-            # Next trial inputs
-            if t < n_trials - 1:
-                inputs[t + 1, 0] = action
-                inputs[t + 1, 1] = 0.0
-                inputs[t + 1, 2] = reward
+            # Drift probabilities
+            reward_probs += np.random.randn(2) * self.volatility
+            reward_probs = np.clip(reward_probs, 0.2, 0.8)
         
-        return TrialData(
+        return SessionData(
             inputs=inputs,
             targets=targets,
-            rewards=rewards,
             actions=actions,
-            trial_info={'reward_probs': reward_probs, 'task': 'probabilistic'}
+            rewards=rewards,
+            states=states,
+            trial_info={'volatility': self.volatility}
         )
 
 
+# =============================================================================
+# Classical Cognitive Models
+# =============================================================================
+
+class ModelFreeRL:
+    """
+    Model-free reinforcement learning agent using Q-learning.
+    
+    Parameters
+    ----------
+    learning_rate : float
+        Learning rate alpha
+    temperature : float
+        Softmax temperature beta
+    
+    Examples
+    --------
+    >>> agent = ModelFreeRL(learning_rate=0.3, temperature=5.0)
+    >>> probs = agent.get_action_probabilities()
+    >>> agent.update(action=0, reward=1.0)
+    """
+    
+    def __init__(
+        self,
+        learning_rate: float = 0.3,
+        temperature: float = 5.0
+    ):
+        self.learning_rate = learning_rate
+        self.temperature = temperature
+        self.Q = np.array([0.5, 0.5])
+    
+    def get_action_probabilities(self) -> np.ndarray:
+        """Get softmax action probabilities."""
+        exp_Q = np.exp(self.temperature * self.Q)
+        return exp_Q / exp_Q.sum()
+    
+    def update(self, action: int, reward: float) -> None:
+        """Update Q-values based on experience."""
+        self.Q[action] += self.learning_rate * (reward - self.Q[action])
+    
+    def reset(self) -> None:
+        """Reset Q-values."""
+        self.Q = np.array([0.5, 0.5])
+
+
+class BayesianAgent:
+    """
+    Bayesian agent that infers reward probabilities.
+    
+    Uses Beta distribution as conjugate prior for Bernoulli rewards.
+    
+    Parameters
+    ----------
+    prior_alpha : float
+        Prior alpha parameter
+    prior_beta : float
+        Prior beta parameter
+    """
+    
+    def __init__(
+        self,
+        prior_alpha: float = 1.0,
+        prior_beta: float = 1.0
+    ):
+        self.prior_alpha = prior_alpha
+        self.prior_beta = prior_beta
+        self.alpha = np.array([prior_alpha, prior_alpha])
+        self.beta = np.array([prior_beta, prior_beta])
+    
+    def get_action_probabilities(self, temperature: float = 5.0) -> np.ndarray:
+        """
+        Get action probabilities based on posterior mean.
+        
+        Parameters
+        ----------
+        temperature : float
+            Softmax temperature
+        
+        Returns
+        -------
+        np.ndarray
+            Action probabilities
+        """
+        # Posterior mean of reward probability
+        posterior_mean = self.alpha / (self.alpha + self.beta)
+        exp_vals = np.exp(temperature * posterior_mean)
+        return exp_vals / exp_vals.sum()
+    
+    def update(self, action: int, reward: float) -> None:
+        """Update posterior based on observation."""
+        if reward > 0:
+            self.alpha[action] += 1
+        else:
+            self.beta[action] += 1
+    
+    def reset(self) -> None:
+        """Reset to prior."""
+        self.alpha = np.array([self.prior_alpha, self.prior_alpha])
+        self.beta = np.array([self.prior_beta, self.prior_beta])
+
+
+# =============================================================================
+# Dataset Class
+# =============================================================================
+
 class TaskDataset:
     """
-    Dataset class for training RNNs on cognitive tasks.
+    Dataset class for cognitive tasks.
     
-    Handles:
-    - Batch generation
-    - Data augmentation
-    - Train/validation/test splitting
+    Generates and manages multiple sessions for training.
+    
+    Parameters
+    ----------
+    task_type : TaskType
+        Type of cognitive task
+    n_sessions : int
+        Number of sessions to generate
+    trials_per_session : int
+        Trials per session
+    seed : int, optional
+        Random seed
+    
+    Attributes
+    ----------
+    sessions : List[SessionData]
+        Generated sessions
+    input_dim : int
+        Input dimension
+    output_dim : int
+        Output dimension
+    
+    Examples
+    --------
+    >>> dataset = TaskDataset(TaskType.REVERSAL_LEARNING, n_sessions=50)
+    >>> inputs, targets, info = dataset.get_batch(16)
+    >>> train_idx, val_idx, test_idx = dataset.split()
     """
     
-    def __init__(self, task_type: TaskType, n_sessions: int = 100, 
-                 trials_per_session: int = 200, seed: int = 42):
-        """
-        Initialize the dataset.
-        
-        Args:
-            task_type: Type of cognitive task
-            n_sessions: Number of sessions to generate
-            trials_per_session: Trials per session
-            seed: Random seed
-        """
+    def __init__(
+        self,
+        task_type: TaskType = TaskType.REVERSAL_LEARNING,
+        n_sessions: int = 100,
+        trials_per_session: int = 150,
+        seed: Optional[int] = None
+    ):
         self.task_type = task_type
         self.n_sessions = n_sessions
         self.trials_per_session = trials_per_session
         
-        # Create task instance
+        # Create task
         if task_type == TaskType.REVERSAL_LEARNING:
             self.task = ReversalLearningTask()
         elif task_type == TaskType.TWO_STAGE:
@@ -541,132 +764,202 @@ class TaskDataset:
         else:
             raise ValueError(f"Unknown task type: {task_type}")
         
-        # Generate all sessions
-        np.random.seed(seed)
-        self.sessions = [
-            self.task.generate_session(trials_per_session, seed=seed+i)
-            for i in range(n_sessions)
-        ]
-        
-        # Store dimensions
         self.input_dim = self.task.input_dim
         self.output_dim = self.task.output_dim
+        
+        # Generate sessions
+        if seed is not None:
+            np.random.seed(seed)
+        
+        self.sessions = [
+            self.task.generate_session(trials_per_session, seed=seed + i if seed else None)
+            for i in range(n_sessions)
+        ]
     
-    def get_batch(self, batch_size: int, session_indices: Optional[List[int]] = None,
-                  device: torch.device = torch.device('cpu')) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_batch(
+        self,
+        batch_size: int,
+        indices: Optional[List[int]] = None,
+        device: Optional[torch.device] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[SessionData]]:
         """
-        Get a batch of data.
+        Get a batch of sessions.
         
-        Args:
-            batch_size: Number of sessions in batch
-            session_indices: Specific sessions to use (optional)
-            device: Torch device
+        Parameters
+        ----------
+        batch_size : int
+            Number of sessions
+        indices : List[int], optional
+            Specific indices to use
+        device : torch.device, optional
+            Device for tensors
         
-        Returns:
-            inputs: [batch, seq_len, input_dim]
-            targets: [batch, seq_len, output_dim]
-            rewards: [batch, seq_len]
+        Returns
+        -------
+        inputs : torch.Tensor
+            Input sequences, shape [batch, seq_len, input_dim]
+        targets : torch.Tensor
+            Target probabilities, shape [batch, seq_len, output_dim]
+        sessions : List[SessionData]
+            Session data objects
         """
-        if session_indices is None:
-            session_indices = np.random.choice(len(self.sessions), batch_size, replace=False)
+        if indices is None:
+            indices = np.random.choice(len(self.sessions), batch_size, replace=False)
         
-        inputs = np.stack([self.sessions[i].inputs for i in session_indices])
-        targets = np.stack([self.sessions[i].targets for i in session_indices])
-        rewards = np.stack([self.sessions[i].rewards for i in session_indices])
+        sessions = [self.sessions[i] for i in indices]
         
-        return (
-            torch.tensor(inputs, dtype=torch.float32, device=device),
-            torch.tensor(targets, dtype=torch.float32, device=device),
-            torch.tensor(rewards, dtype=torch.float32, device=device)
-        )
+        inputs = np.stack([s.inputs for s in sessions])
+        targets = np.stack([s.targets for s in sessions])
+        
+        inputs_tensor = torch.tensor(inputs, dtype=torch.float32)
+        targets_tensor = torch.tensor(targets, dtype=torch.float32)
+        
+        if device is not None:
+            inputs_tensor = inputs_tensor.to(device)
+            targets_tensor = targets_tensor.to(device)
+        
+        return inputs_tensor, targets_tensor, sessions
     
-    def split(self, train_frac: float = 0.7, val_frac: float = 0.15) -> Tuple[List[int], List[int], List[int]]:
+    def split(
+        self,
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.15
+    ) -> Tuple[List[int], List[int], List[int]]:
         """
-        Split sessions into train/validation/test sets.
+        Split dataset into train/val/test indices.
         
-        Returns:
-            train_indices, val_indices, test_indices
+        Parameters
+        ----------
+        train_ratio : float
+            Fraction for training
+        val_ratio : float
+            Fraction for validation
+        
+        Returns
+        -------
+        Tuple[List[int], List[int], List[int]]
+            (train_indices, val_indices, test_indices)
         """
         n = len(self.sessions)
         indices = np.random.permutation(n)
         
-        train_end = int(n * train_frac)
-        val_end = int(n * (train_frac + val_frac))
+        train_end = int(n * train_ratio)
+        val_end = train_end + int(n * val_ratio)
         
         return (
-            indices[:train_end].tolist(),
-            indices[train_end:val_end].tolist(),
-            indices[val_end:].tolist()
+            list(indices[:train_end]),
+            list(indices[train_end:val_end]),
+            list(indices[val_end:])
         )
 
 
-def compute_choice_accuracy(predictions: torch.Tensor, targets: torch.Tensor) -> float:
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def compute_choice_accuracy(
+    outputs: torch.Tensor,
+    targets: torch.Tensor
+) -> float:
     """
-    Compute choice prediction accuracy.
+    Compute choice accuracy.
     
-    Args:
-        predictions: Model outputs [batch, seq_len, 2]
-        targets: Target probabilities [batch, seq_len, 2]
+    Parameters
+    ----------
+    outputs : torch.Tensor
+        Model outputs (logits), shape [batch, seq_len, 2]
+    targets : torch.Tensor
+        Target probabilities, shape [batch, seq_len, 2]
     
-    Returns:
-        Accuracy (fraction of correct predictions)
+    Returns
+    -------
+    float
+        Accuracy (0 to 1)
     """
-    pred_actions = predictions.argmax(dim=-1)
-    target_actions = targets.argmax(dim=-1)
-    
-    accuracy = (pred_actions == target_actions).float().mean().item()
-    return accuracy
+    pred = torch.argmax(outputs, dim=-1)
+    target = torch.argmax(targets, dim=-1)
+    return (pred == target).float().mean().item()
 
 
-def compute_negative_log_likelihood(predictions: torch.Tensor, 
-                                    targets: torch.Tensor) -> torch.Tensor:
+def compute_negative_log_likelihood(
+    outputs: torch.Tensor,
+    targets: torch.Tensor
+) -> torch.Tensor:
     """
     Compute negative log-likelihood loss.
     
-    This is the standard loss for choice prediction:
-        NLL = -Σ target * log(softmax(prediction))
+    Parameters
+    ----------
+    outputs : torch.Tensor
+        Model outputs (logits)
+    targets : torch.Tensor
+        Target probabilities
     
-    Args:
-        predictions: Raw logits [batch, seq_len, 2]
-        targets: Target probabilities [batch, seq_len, 2]
-    
-    Returns:
-        Mean NLL across batch and time
+    Returns
+    -------
+    torch.Tensor
+        NLL loss
     """
-    # Apply log-softmax
-    log_probs = torch.log_softmax(predictions, dim=-1)
-    
-    # Compute NLL (cross-entropy)
-    nll = -(targets * log_probs).sum(dim=-1)
-    
+    probs = torch.softmax(outputs, dim=-1)
+    # Avoid log(0)
+    probs = torch.clamp(probs, min=1e-10)
+    nll = -torch.sum(targets * torch.log(probs), dim=-1)
     return nll.mean()
 
 
+# =============================================================================
+# Main Execution (Testing)
+# =============================================================================
+
 if __name__ == "__main__":
+    print("=" * 60)
     print("Testing Cognitive Tasks Module")
-    print("=" * 50)
+    print("=" * 60)
     
-    # Test reversal learning
-    print("\n1. Reversal Learning Task")
-    reversal_task = ReversalLearningTask()
-    session = reversal_task.generate_session(100, seed=42)
-    print(f"   Generated {len(session.rewards)} trials")
-    print(f"   Reversals occurred at trials: {session.trial_info['reversal_trials']}")
-    print(f"   Mean reward: {session.rewards.mean():.3f}")
+    # Test Reversal Learning
+    print("\n1. Testing Reversal Learning Task...")
+    task = ReversalLearningTask()
+    session = task.generate_session(200, seed=42)
+    print(f"   Input shape: {session.inputs.shape}")
+    print(f"   Number of reversals: {len(session.trial_info['reversal_trials'])}")
     
-    # Test two-stage task
-    print("\n2. Two-Stage Task")
-    two_stage_task = TwoStageTask()
-    session = two_stage_task.generate_session(100, seed=42)
-    stay_probs = two_stage_task.compute_stay_probabilities(session)
-    print(f"   Stay probabilities:")
-    for cond, prob in stay_probs.items():
-        print(f"     {cond}: {prob:.3f}")
+    onehot = task.get_onehot_inputs(session)
+    print(f"   One-hot shape: {onehot.shape}")
     
-    # Test dataset
-    print("\n3. Task Dataset")
-    dataset = TaskDataset(TaskType.REVERSAL_LEARNING, n_sessions=20)
-    inputs, targets, rewards = dataset.get_batch(4)
-    print(f"   Batch shapes: inputs={inputs.shape}, targets={targets.shape}")
+    # Test Two-Stage Task
+    print("\n2. Testing Two-Stage Task...")
+    task2 = TwoStageTask()
+    session2 = task2.generate_session(200, seed=42)
+    print(f"   Input shape: {session2.inputs.shape}")
     
-    print("\n✓ All tests passed!")
+    stay_probs = task2.compute_stay_probabilities(
+        session2.actions,
+        session2.rewards,
+        session2.trial_info['transitions']
+    )
+    mf_idx, mb_idx = task2.compute_mb_mf_indices(stay_probs)
+    print(f"   Model-free index: {mf_idx:.3f}")
+    print(f"   Model-based index: {mb_idx:.3f}")
+    
+    # Test Dataset
+    print("\n3. Testing TaskDataset...")
+    dataset = TaskDataset(TaskType.REVERSAL_LEARNING, n_sessions=50, seed=42)
+    inputs, targets, _ = dataset.get_batch(8)
+    print(f"   Batch inputs shape: {inputs.shape}")
+    print(f"   Batch targets shape: {targets.shape}")
+    
+    train_idx, val_idx, test_idx = dataset.split()
+    print(f"   Split: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
+    
+    # Test classical models
+    print("\n4. Testing Classical Models...")
+    mf_agent = ModelFreeRL()
+    bayesian = BayesianAgent()
+    
+    print(f"   MF initial probs: {mf_agent.get_action_probabilities()}")
+    mf_agent.update(0, 1.0)
+    print(f"   MF after A0 reward: {mf_agent.get_action_probabilities()}")
+    
+    print("\n" + "=" * 60)
+    print("All cognitive tasks tests passed!")
+    print("=" * 60)

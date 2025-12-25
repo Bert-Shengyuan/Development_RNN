@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Training and Evaluation Module for Brain-Inspired RNNs
 ======================================================
@@ -6,88 +5,58 @@ Training and Evaluation Module for Brain-Inspired RNNs
 This module handles the training pipeline for comparing premature vs mature
 brain-inspired RNNs on cognitive tasks.
 
-Key Components
---------------
+Key Components:
 1. Training loop with developmental regularization
 2. Performance comparison between developmental stages
 3. Metrics computation and logging
 4. Learning dynamics analysis
 
-Training Objective
-------------------
+Training Objective:
+-------------------
 The total loss combines task performance and developmental constraints:
 
-    L_total = L_task + alpha*||W||_* + beta*D_eff(W) + L_spectral - lambda*H(W)
+    L_total = L_task + α||W||_* + β*EffRank(W) + L_spectral - λ*Heterogeneity
 
 where:
-    - L_task: Negative log-likelihood of correct choices
-    - ||W||_*: Nuclear norm (promotes low-rank)
-    - D_eff(W): Effective rank penalty
-    - L_spectral: Singular value decay matching
-    - H(W): Response heterogeneity (maximized for mature)
-
-Reference
----------
-Ji-An et al. "Discovering cognitive strategies with tiny recurrent neural networks"
-Nature (2025)
+- L_task: Negative log-likelihood of correct choices
+- ||W||_*: Nuclear norm (promotes low-rank)
+- EffRank(W): Effective rank penalty
+- L_spectral: Singular value decay matching
+- Heterogeneity: Response differentiation (maximized for mature)
 
 Author: Computational Neuroscience Research
 """
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple
 from dataclasses import dataclass
 import time
 from collections import defaultdict
 
-from brain_inspired_rnn import (
+from History.brain_inspired_rnn import (
     BrainInspiredRNN, TinyGRU,
     create_premature_config, create_mature_config,
-    DevelopmentalConfig, get_model_metrics
+    get_model_metrics
 )
-from cognitive_tasks import (
+from History.cognitive_tasks import (
     TaskDataset, TaskType, 
     compute_choice_accuracy, compute_negative_log_likelihood
 )
 
-
-# =============================================================================
-# Configuration
-# =============================================================================
 
 @dataclass
 class TrainingConfig:
     """
     Configuration for the training process.
     
-    Contains hyperparameters for optimization, regularization,
-    early stopping, and logging.
-    
-    Attributes
-    ----------
-    learning_rate : float
-        Initial learning rate for Adam optimizer
-    weight_decay : float
-        L2 regularization strength
-    n_epochs : int
-        Maximum number of training epochs
-    batch_size : int
-        Number of sessions per batch
-    reg_warmup_epochs : int
-        Epochs to gradually increase regularization strength
-    patience : int
-        Early stopping patience (epochs without improvement)
-    min_delta : float
-        Minimum improvement to reset patience counter
-    log_interval : int
-        Epochs between logging
-    device : str
-        Computation device ('cuda' or 'cpu')
+    Contains hyperparameters for:
+    - Optimization (learning rate, epochs, batch size)
+    - Regularization strengths
+    - Early stopping criteria
+    - Logging frequency
     """
     # Optimization
     learning_rate: float = 1e-3
@@ -96,7 +65,7 @@ class TrainingConfig:
     batch_size: int = 16
     
     # Regularization schedule
-    reg_warmup_epochs: int = 10
+    reg_warmup_epochs: int = 10  # Gradually increase regularization
     
     # Early stopping
     patience: int = 500
@@ -109,58 +78,27 @@ class TrainingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# =============================================================================
-# Trainer Class
-# =============================================================================
-
 class Trainer:
     """
     Trainer class for brain-inspired RNNs.
     
-    Handles the complete training pipeline including:
-        - Training with developmental constraints
-        - Validation monitoring
-        - Metrics computation
-        - Model checkpointing
-        - Early stopping
-    
-    Parameters
-    ----------
-    model : Union[BrainInspiredRNN, TinyGRU]
-        The model to train
-    dataset : TaskDataset
-        Dataset with cognitive task data
-    config : TrainingConfig
-        Training hyperparameters
-    
-    Attributes
-    ----------
-    optimizer : Adam
-        Optimizer instance
-    scheduler : CosineAnnealingLR
-        Learning rate scheduler
-    history : Dict[str, List[float]]
-        Training history
-    best_val_loss : float
-        Best validation loss seen
-    best_model_state : Dict
-        State dict of best model
-    
-    Examples
-    --------
-    >>> model = BrainInspiredRNN(3, 2, create_mature_config())
-    >>> dataset = TaskDataset(TaskType.REVERSAL_LEARNING)
-    >>> trainer = Trainer(model, dataset, TrainingConfig())
-    >>> history = trainer.train()
-    >>> test_metrics = trainer.test()
+    Handles:
+    - Training with developmental constraints
+    - Validation monitoring
+    - Metrics computation
+    - Model checkpointing
     """
     
-    def __init__(
-        self, 
-        model: Union[BrainInspiredRNN, TinyGRU], 
-        dataset: TaskDataset, 
-        config: TrainingConfig
-    ):
+    def __init__(self, model: BrainInspiredRNN, dataset: TaskDataset, 
+                 config: TrainingConfig):
+        """
+        Initialize the trainer.
+        
+        Args:
+            model: BrainInspiredRNN or TinyGRU model
+            dataset: TaskDataset with cognitive task data
+            config: TrainingConfig with hyperparameters
+        """
         self.model = model.to(config.device)
         self.dataset = dataset
         self.config = config
@@ -174,50 +112,37 @@ class Trainer:
         
         # Learning rate scheduler
         self.scheduler = CosineAnnealingLR(
-            self.optimizer, 
-            T_max=config.n_epochs, 
-            eta_min=1e-5
+            self.optimizer, T_max=config.n_epochs, eta_min=1e-5
         )
         
         # Data splits
         self.train_idx, self.val_idx, self.test_idx = dataset.split()
         
         # Training history
-        self.history: Dict[str, List[float]] = defaultdict(list)
+        self.history = defaultdict(list)
         
         # Best model tracking
         self.best_val_loss = float('inf')
-        self.best_model_state: Optional[Dict] = None
+        self.best_model_state = None
         self.patience_counter = 0
-    
-    def compute_loss(
-        self, 
-        inputs: torch.Tensor, 
-        targets: torch.Tensor,
-        epoch: int
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        
+    def compute_loss(self, inputs: torch.Tensor, targets: torch.Tensor,
+                     epoch: int) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute total loss including task loss and regularization.
         
         The loss combines:
-            1. Task loss: NLL of correct choice prediction
-            2. Developmental regularization (for BrainInspiredRNN only)
+        1. Task loss: NLL of correct choice prediction
+        2. Developmental regularization (for BrainInspiredRNN)
         
-        Parameters
-        ----------
-        inputs : torch.Tensor
-            Input sequences, shape [batch, seq_len, input_dim]
-        targets : torch.Tensor
-            Target probabilities, shape [batch, seq_len, output_dim]
-        epoch : int
-            Current epoch (for regularization warmup)
+        Args:
+            inputs: Input sequences [batch, seq_len, input_dim]
+            targets: Target probabilities [batch, seq_len, output_dim]
+            epoch: Current epoch (for regularization warmup)
         
-        Returns
-        -------
-        total_loss : torch.Tensor
-            Combined loss tensor
-        loss_components : Dict[str, float]
-            Dictionary of individual loss components
+        Returns:
+            total_loss: Combined loss tensor
+            loss_components: Dictionary of individual loss components
         """
         # Forward pass
         outputs, h_final = self.model(inputs)
@@ -248,31 +173,25 @@ class Trainer:
         """
         Train for one epoch.
         
-        Parameters
-        ----------
-        epoch : int
-            Current epoch number
+        Args:
+            epoch: Current epoch number
         
-        Returns
-        -------
-        Dict[str, float]
+        Returns:
             Dictionary of mean loss components for this epoch
         """
         self.model.train()
         
-        epoch_losses: Dict[str, List[float]] = defaultdict(list)
+        epoch_losses = defaultdict(list)
         n_batches = len(self.train_idx) // self.config.batch_size
         
         for batch_idx in range(n_batches):
-            # Get batch indices
+            # Get batch
             start_idx = batch_idx * self.config.batch_size
             end_idx = start_idx + self.config.batch_size
             batch_indices = self.train_idx[start_idx:end_idx]
             
-            # Get batch data
             inputs, targets, _ = self.dataset.get_batch(
-                len(batch_indices), 
-                batch_indices,
+                len(batch_indices), batch_indices,
                 device=torch.device(self.config.device)
             )
             
@@ -281,7 +200,7 @@ class Trainer:
             loss, loss_components = self.compute_loss(inputs, targets, epoch)
             loss.backward()
             
-            # Gradient clipping for stability
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
             self.optimizer.step()
@@ -299,19 +218,15 @@ class Trainer:
         """
         Evaluate on validation set.
         
-        Returns
-        -------
-        val_loss : float
-            Mean validation loss
-        val_accuracy : float
-            Mean validation accuracy
+        Returns:
+            val_loss: Mean validation loss
+            val_accuracy: Mean validation accuracy
         """
         self.model.eval()
         
         with torch.no_grad():
             inputs, targets, _ = self.dataset.get_batch(
-                len(self.val_idx), 
-                self.val_idx,
+                len(self.val_idx), self.val_idx,
                 device=torch.device(self.config.device)
             )
             
@@ -326,21 +241,14 @@ class Trainer:
         """
         Evaluate on test set.
         
-        Returns
-        -------
-        Dict[str, float]
-            Dictionary of test metrics including:
-            - 'loss': Test loss (NLL)
-            - 'accuracy': Test accuracy
-            - 'effective_rank': Effective rank (BrainInspiredRNN only)
-            - 'response_heterogeneity': Response heterogeneity (BrainInspiredRNN only)
+        Returns:
+            Dictionary of test metrics
         """
         self.model.eval()
         
         with torch.no_grad():
             inputs, targets, _ = self.dataset.get_batch(
-                len(self.test_idx), 
-                self.test_idx,
+                len(self.test_idx), self.test_idx,
                 device=torch.device(self.config.device)
             )
             
@@ -349,18 +257,16 @@ class Trainer:
             test_loss = compute_negative_log_likelihood(outputs, targets).item()
             test_accuracy = compute_choice_accuracy(outputs, targets)
             
-            # Core metrics
+            # Additional metrics for BrainInspiredRNN
             metrics = {
                 'loss': test_loss,
                 'accuracy': test_accuracy
             }
             
-            # Additional metrics for BrainInspiredRNN
             if isinstance(self.model, BrainInspiredRNN):
                 metrics['effective_rank'] = self.model.compute_effective_rank().item()
-                metrics['response_heterogeneity'] = (
+                metrics['response_heterogeneity'] = \
                     self.model.compute_response_heterogeneity(h_final).item()
-                )
         
         return metrics
     
@@ -368,17 +274,11 @@ class Trainer:
         """
         Full training loop.
         
-        Parameters
-        ----------
-        verbose : bool
-            Whether to print progress
+        Args:
+            verbose: Whether to print progress
         
-        Returns
-        -------
-        Dict[str, List[float]]
-            Training history with keys:
-            - 'train_task', 'train_total', etc.
-            - 'val_loss', 'val_accuracy'
+        Returns:
+            Training history dictionary
         """
         start_time = time.time()
         
@@ -401,10 +301,8 @@ class Trainer:
             # Early stopping check
             if val_loss < self.best_val_loss - self.config.min_delta:
                 self.best_val_loss = val_loss
-                self.best_model_state = {
-                    k: v.cpu().clone() 
-                    for k, v in self.model.state_dict().items()
-                }
+                self.best_model_state = {k: v.cpu().clone() 
+                                         for k, v in self.model.state_dict().items()}
                 self.patience_counter = 0
             else:
                 self.patience_counter += 1
@@ -413,13 +311,11 @@ class Trainer:
             if verbose and (epoch % self.config.log_interval == 0 or 
                            epoch == self.config.n_epochs - 1):
                 elapsed = time.time() - start_time
-                print(
-                    f"Epoch {epoch:3d} | "
-                    f"Train Loss: {train_losses['total']:.4f} | "
-                    f"Val Loss: {val_loss:.4f} | "
-                    f"Val Acc: {val_accuracy:.3f} | "
-                    f"Time: {elapsed:.1f}s"
-                )
+                print(f"Epoch {epoch:3d} | "
+                      f"Train Loss: {train_losses['total']:.4f} | "
+                      f"Val Loss: {val_loss:.4f} | "
+                      f"Val Acc: {val_accuracy:.3f} | "
+                      f"Time: {elapsed:.1f}s")
             
             # Early stopping
             if self.patience_counter >= self.config.patience:
@@ -434,59 +330,31 @@ class Trainer:
         return dict(self.history)
 
 
-# =============================================================================
-# Main Comparison Function
-# =============================================================================
-
-def run_developmental_comparison(
-    task_type: TaskType = TaskType.REVERSAL_LEARNING,
-    n_sessions: int = 80,
-    trials_per_session: int = 150,
-    n_hidden: int = 32,
-    n_epochs: int = 80,
-    seed: int = 42
-) -> Dict:
+def run_developmental_comparison(task_type: TaskType = TaskType.REVERSAL_LEARNING,
+                                 n_sessions: int = 80,
+                                 trials_per_session: int = 150,
+                                 n_hidden: int = 32,
+                                 n_epochs: int = 80,
+                                 seed: int = 42) -> Dict:
     """
     Run a full comparison between premature and mature brain-inspired RNNs.
     
     This is the main experiment function that:
-        1. Creates datasets for the cognitive task
-        2. Trains premature and mature RNNs
-        3. Trains a baseline GRU for comparison
-        4. Compares performance and structural metrics
+    1. Creates datasets for the cognitive task
+    2. Trains premature and mature RNNs
+    3. Trains a baseline GRU for comparison
+    4. Compares performance and structural metrics
     
-    Parameters
-    ----------
-    task_type : TaskType
-        Type of cognitive task
-    n_sessions : int
-        Number of training sessions
-    trials_per_session : int
-        Trials per session
-    n_hidden : int
-        Number of hidden units
-    n_epochs : int
-        Training epochs
-    seed : int
-        Random seed
+    Args:
+        task_type: Type of cognitive task
+        n_sessions: Number of training sessions
+        trials_per_session: Trials per session
+        n_hidden: Number of hidden units
+        n_epochs: Training epochs
+        seed: Random seed
     
-    Returns
-    -------
-    Dict
-        Dictionary with all comparison results:
-        - 'premature': Results for premature RNN
-        - 'mature': Results for mature RNN
-        - 'baseline_gru': Results for baseline GRU
-        
-        Each contains 'history', 'test_metrics', 'model_metrics', 'config'
-    
-    Examples
-    --------
-    >>> results = run_developmental_comparison(
-    ...     task_type=TaskType.REVERSAL_LEARNING,
-    ...     n_epochs=50
-    ... )
-    >>> print(results['mature']['test_metrics']['accuracy'])
+    Returns:
+        Dictionary with all comparison results
     """
     print("=" * 70)
     print("BRAIN-INSPIRED RNN DEVELOPMENTAL COMPARISON")
@@ -514,9 +382,7 @@ def run_developmental_comparison(
     
     results = {}
     
-    # -------------------------------------------------------------------------
     # 1. Train Premature RNN
-    # -------------------------------------------------------------------------
     print("-" * 70)
     print("Training PREMATURE Brain-Inspired RNN")
     print("-" * 70)
@@ -541,9 +407,7 @@ def run_developmental_comparison(
     print(f"  Effective Rank: {premature_test['effective_rank']:.3f}")
     print(f"  Response Heterogeneity: {premature_test['response_heterogeneity']:.4f}")
     
-    # -------------------------------------------------------------------------
     # 2. Train Mature RNN
-    # -------------------------------------------------------------------------
     print("\n" + "-" * 70)
     print("Training MATURE Brain-Inspired RNN")
     print("-" * 70)
@@ -573,9 +437,7 @@ def run_developmental_comparison(
     print(f"  Effective Rank: {mature_test['effective_rank']:.3f}")
     print(f"  Response Heterogeneity: {mature_test['response_heterogeneity']:.4f}")
     
-    # -------------------------------------------------------------------------
-    # 3. Train Baseline GRU (Ji-An et al. style)
-    # -------------------------------------------------------------------------
+    # 3. Train Baseline GRU (for comparison with Ji-An et al.)
     print("\n" + "-" * 70)
     print("Training BASELINE GRU (Ji-An et al. style)")
     print("-" * 70)
@@ -602,44 +464,33 @@ def run_developmental_comparison(
     print(f"  Accuracy: {gru_test['accuracy']:.4f}")
     print(f"  Loss: {gru_test['loss']:.4f}")
     
-    # -------------------------------------------------------------------------
     # Summary comparison
-    # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("COMPARISON SUMMARY")
     print("=" * 70)
     
-    header = f"{'Model':<25} {'Accuracy':<12} {'Loss':<12} {'Eff. Rank':<12} {'Heterogeneity':<15}"
-    print(f"\n{header}")
+    print(f"\n{'Model':<25} {'Accuracy':<12} {'Loss':<12} {'Eff. Rank':<12} {'Heterogeneity':<15}")
     print("-" * 76)
     
-    print(
-        f"{'Premature RNN':<25} "
-        f"{premature_test['accuracy']:<12.4f} "
-        f"{premature_test['loss']:<12.4f} "
-        f"{premature_test['effective_rank']:<12.3f} "
-        f"{premature_test['response_heterogeneity']:<15.4f}"
-    )
+    print(f"{'Premature RNN':<25} "
+          f"{premature_test['accuracy']:<12.4f} "
+          f"{premature_test['loss']:<12.4f} "
+          f"{premature_test['effective_rank']:<12.3f} "
+          f"{premature_test['response_heterogeneity']:<15.4f}")
     
-    print(
-        f"{'Mature RNN':<25} "
-        f"{mature_test['accuracy']:<12.4f} "
-        f"{mature_test['loss']:<12.4f} "
-        f"{mature_test['effective_rank']:<12.3f} "
-        f"{mature_test['response_heterogeneity']:<15.4f}"
-    )
+    print(f"{'Mature RNN':<25} "
+          f"{mature_test['accuracy']:<12.4f} "
+          f"{mature_test['loss']:<12.4f} "
+          f"{mature_test['effective_rank']:<12.3f} "
+          f"{mature_test['response_heterogeneity']:<15.4f}")
     
-    print(
-        f"{'Baseline GRU (d=4)':<25} "
-        f"{gru_test['accuracy']:<12.4f} "
-        f"{gru_test['loss']:<12.4f} "
-        f"{'N/A':<12} "
-        f"{'N/A':<15}"
-    )
+    print(f"{'Baseline GRU (d=4)':<25} "
+          f"{gru_test['accuracy']:<12.4f} "
+          f"{gru_test['loss']:<12.4f} "
+          f"{'N/A':<12} "
+          f"{'N/A':<15}")
     
-    # -------------------------------------------------------------------------
     # Key findings
-    # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("KEY DEVELOPMENTAL DIFFERENCES")
     print("=" * 70)
@@ -649,42 +500,37 @@ def run_developmental_comparison(
     acc_diff = mature_test['accuracy'] - premature_test['accuracy']
     
     print(f"\n1. Effective Rank: Mature is {eff_rank_diff:.3f} LOWER than Premature")
-    print("   -> Mature brain dynamics are more compressed (lower dimensionality)")
+    print(f"   → Mature brain dynamics are more compressed (lower dimensionality)")
     
     print(f"\n2. Response Heterogeneity: Mature is {hetero_diff:.4f} HIGHER than Premature")
-    print("   -> Mature brain shows more specialized, differentiated responses")
+    print(f"   → Mature brain shows more specialized, differentiated responses")
     
     print(f"\n3. Task Accuracy: Mature is {acc_diff:+.4f} compared to Premature")
     if acc_diff > 0.01:
-        print("   -> Lower dimensionality with higher specialization improves performance")
+        print(f"   → Lower dimensionality with higher specialization improves performance")
     elif acc_diff < -0.01:
-        print("   -> Over-compression may limit flexibility in this task")
+        print(f"   → Over-compression may limit flexibility in this task")
     else:
-        print("   -> Similar task performance with different computational strategies")
+        print(f"   → Similar task performance with different computational strategies")
     
     return results
 
 
-def analyze_learning_dynamics(results: Dict, save_data: bool = False) -> Dict:
+def analyze_learning_dynamics(results: Dict, save_data: bool = True) -> Dict:
     """
     Analyze the learning dynamics of trained models.
     
-    Computes metrics including:
-        - Learning curve statistics
-        - Convergence rates
-        - Stability metrics
+    Computes:
+    - Learning curve statistics
+    - Convergence rates
+    - Stability metrics
     
-    Parameters
-    ----------
-    results : Dict
-        Results from run_developmental_comparison
-    save_data : bool
-        Whether to save analysis data (not implemented)
+    Args:
+        results: Results from run_developmental_comparison
+        save_data: Whether to save analysis data
     
-    Returns
-    -------
-    Dict
-        Dictionary of learning dynamics analysis for each model
+    Returns:
+        Dictionary of learning dynamics analysis
     """
     analysis = {}
     
@@ -715,111 +561,23 @@ def analyze_learning_dynamics(results: Dict, save_data: bool = False) -> Dict:
     return analysis
 
 
-def save_model_checkpoint(
-    model: nn.Module, 
-    filepath: str,
-    config: Optional[DevelopmentalConfig] = None,
-    metrics: Optional[Dict] = None
-) -> None:
-    """
-    Save model checkpoint with configuration and metrics.
-    
-    Parameters
-    ----------
-    model : nn.Module
-        Model to save
-    filepath : str
-        Path for checkpoint file
-    config : DevelopmentalConfig, optional
-        Model configuration
-    metrics : Dict, optional
-        Training metrics
-    """
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-    }
-    if config is not None:
-        checkpoint['config'] = {
-            'n_hidden': config.n_hidden,
-            'rank': config.rank,
-            'sv_decay_gamma': config.sv_decay_gamma,
-            'developmental_stage': config.developmental_stage
-        }
-    if metrics is not None:
-        checkpoint['metrics'] = metrics
-    
-    torch.save(checkpoint, filepath)
-    print(f"Checkpoint saved to: {filepath}")
-
-
-def load_model_checkpoint(
-    filepath: str,
-    model_class: type = BrainInspiredRNN,
-    input_dim: int = 3,
-    output_dim: int = 2
-) -> Tuple[nn.Module, Optional[Dict]]:
-    """
-    Load model from checkpoint.
-    
-    Parameters
-    ----------
-    filepath : str
-        Path to checkpoint file
-    model_class : type
-        Model class to instantiate
-    input_dim : int
-        Input dimension
-    output_dim : int
-        Output dimension
-    
-    Returns
-    -------
-    model : nn.Module
-        Loaded model
-    config_dict : Dict, optional
-        Configuration dictionary if saved
-    """
-    checkpoint = torch.load(filepath, map_location='cpu')
-    
-    config_dict = checkpoint.get('config', None)
-    if config_dict is not None:
-        config = DevelopmentalConfig(**config_dict)
-        model = model_class(input_dim, output_dim, config)
-    else:
-        model = model_class(input_dim, output_dim, create_mature_config())
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    return model, config_dict
-
-
-# =============================================================================
-# Main Execution
-# =============================================================================
-
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Testing Training Module")
-    print("=" * 60)
-    
-    # Quick test with reduced parameters
-    print("\nRunning quick developmental comparison test...")
-    
+    # Run the main comparison experiment
     results = run_developmental_comparison(
         task_type=TaskType.REVERSAL_LEARNING,
-        n_sessions=30,
-        trials_per_session=100,
-        n_hidden=16,
-        n_epochs=20,
+        n_sessions=80,
+        trials_per_session=150,
+        n_hidden=32,
+        n_epochs=80,
         seed=42
     )
     
     # Analyze learning dynamics
     dynamics = analyze_learning_dynamics(results)
     
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("LEARNING DYNAMICS ANALYSIS")
-    print("=" * 60)
+    print("=" * 70)
     
     for model_name, metrics in dynamics.items():
         print(f"\n{model_name.upper()}:")
@@ -827,7 +585,3 @@ if __name__ == "__main__":
         print(f"  Best accuracy: {metrics['best_accuracy']:.4f}")
         print(f"  Convergence rate: {metrics['convergence_rate']:.5f}")
         print(f"  Final stability (val loss std): {metrics['val_loss_std']:.5f}")
-    
-    print("\n" + "=" * 60)
-    print("Training module tests complete!")
-    print("=" * 60)

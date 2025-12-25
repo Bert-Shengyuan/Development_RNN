@@ -43,7 +43,6 @@ Author: Computational Neuroscience Research
 """
 
 import os
-import sys
 import argparse
 import json
 import time
@@ -53,19 +52,13 @@ import torch
 
 # Import project modules
 from brain_inspired_rnn import (
-    BrainInspiredRNN, TinyGRU,
-    create_premature_config, create_mature_config,
-    DevelopmentalConfig, get_model_metrics
+    DevelopmentalConfig
 )
-from cognitive_tasks import TaskType, TaskDataset
-from training import run_developmental_comparison, analyze_learning_dynamics, TrainingConfig
+from cognitive_tasks import TaskType
+from training import run_developmental_comparison, analyze_learning_dynamics
 from visualization import (
-    create_comprehensive_figure, generate_all_figures,
-    plot_learning_curves, plot_singular_value_spectra,
-    COLORS
+    generate_all_figures
 )
-
-import matplotlib.pyplot as plt
 
 
 def parse_args():

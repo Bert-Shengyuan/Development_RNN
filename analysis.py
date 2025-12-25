@@ -1,49 +1,112 @@
+#!/usr/bin/env python3
 """
-Detailed Analysis Module: Cognitive Mechanisms in Developmental RNNs
-=====================================================================
+Comprehensive Dynamical Systems Analysis for Developmental RNNs
+================================================================
 
-This module provides in-depth analysis of the computational mechanisms
-underlying developmental differences between premature and mature
-brain-inspired RNNs.
+This module merges functionality from:
+- dynamical_analysis.py (Phase portraits, vector fields, comparisons)
+- analysis.py (Fixed points, Lyapunov, MB/MF signatures)
 
-Analyses Include:
------------------
-1. Fixed Point Analysis: Characterize attractor structure
-2. Jacobian Spectrum: Local linearization stability
-3. Information Flow: How information propagates through the network
-4. Reversal Dynamics: Adaptation speed after contingency changes
-5. Model-Based vs Model-Free Signatures: Two-stage task analysis
+Analyses Include
+----------------
+1. Fixed Point Analysis: Find and characterize attractors
+2. Phase Portrait Generation: L(t) vs Delta-L(t) plots (Figure 3)
+3. Vector Field Generation: 2D state space flow (Figure 4)
+4. Lyapunov Exponent: Global dynamical stability
+5. Preference Setpoints: Normalized asymptotic preferences
+6. Model-Based vs Model-Free Signatures: Two-stage task analysis
+7. Developmental Comparison: Comprehensive metrics
 
-Mathematical Framework:
------------------------
-For a trained RNN with dynamics h_{t+1} = f(h_t, x_t), we analyze:
+Mathematical Framework
+----------------------
+For d=1 models:
+    L(t) = log(P(A1)/P(A2)) = beta * h_t^{(1)}
+    Delta-L(t) = L(t+1) - L(t) = f(L(t), x_t)
 
-1. Fixed Points: h* such that h* = f(h*, 0)
-2. Jacobian: J = ∂f/∂h |_{h=h*}
-3. Eigenvalue spectrum of J determines local stability
-4. Effective connectivity: How perturbations propagate
+Fixed points: L* such that Delta-L(L*, x) = 0
 
-Reference: 
+For d>1 models:
+    Vector field: (Delta-h1, Delta-h2) on (h1, h2) grid
+
+References
+----------
+- Ji-An et al. (2025) "Discovering cognitive strategies with tiny RNNs"
 - Sussillo & Barak (2013) "Opening the Black Box"
 - Mastrogiuseppe & Ostojic (2018) "Linking Connectivity, Dynamics, and Computations"
+
+Author: Computational Neuroscience Research
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple, Optional
+import torch.nn.functional as F
+from typing import Dict, List, Tuple, Optional, Union
+from dataclasses import dataclass
 from scipy import stats
-from scipy.linalg import schur
+from scipy.optimize import brentq
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 
-from brain_inspired_rnn import BrainInspiredRNN, DevelopmentalConfig
-from cognitive_tasks import (
-    ReversalLearningTask, TwoStageTask, 
-    TaskDataset, TaskType, TrialData
-)
 
+# =============================================================================
+# Data Structures for Analysis Results
+# =============================================================================
+
+@dataclass
+class PhasePortraitData:
+    """Data structure for phase portrait analysis."""
+    logits: np.ndarray              # L(t) values
+    logit_changes: np.ndarray       # Delta-L(t) = L(t+1) - L(t)
+    actions: np.ndarray             # Actions taken
+    rewards: np.ndarray             # Rewards received
+    input_conditions: np.ndarray    # Discrete input condition indices
+    
+    # Fixed point analysis
+    fixed_points: Dict[int, float]  # Per-condition fixed points
+    preference_setpoints: Dict[int, float]  # Normalized fixed points
+
+
+@dataclass
+class VectorFieldData:
+    """Data structure for 2D vector field analysis."""
+    h1_grid: np.ndarray            # Grid of h1 values
+    h2_grid: np.ndarray            # Grid of h2 values
+    delta_h1: Dict[int, np.ndarray]  # Per-condition Delta-h1
+    delta_h2: Dict[int, np.ndarray]  # Per-condition Delta-h2
+    fixed_points: Dict[int, List[Tuple[float, float]]]  # Per-condition FPs
+
+
+@dataclass
+class DevelopmentalComparison:
+    """Results of comparing premature vs mature RNN dynamics."""
+    # Phase portrait metrics
+    premature_fixed_points: Dict[int, float]
+    mature_fixed_points: Dict[int, float]
+    
+    # Preference setpoints
+    premature_setpoints: Dict[int, float]
+    mature_setpoints: Dict[int, float]
+    
+    # Learning rate analysis
+    premature_learning_rates: Dict[str, float]
+    mature_learning_rates: Dict[str, float]
+    
+    # Stability analysis
+    premature_stability: Dict[str, float]
+    mature_stability: Dict[str, float]
+    
+    # Summary metrics
+    dimensionality_premature: float
+    dimensionality_mature: float
+    specialization_premature: float
+    specialization_mature: float
+
+
+# =============================================================================
+# Fixed Point Finder
+# =============================================================================
 
 class FixedPointFinder:
     """
@@ -51,52 +114,49 @@ class FixedPointFinder:
     
     Fixed points h* satisfy: h* = f(h*, x=0)
     
-    We use optimization to find these:
-        min_h ||h - f(h, 0)||²
-    
-    The Jacobian at fixed points determines stability:
-    - Eigenvalues |λ| < 1: stable (attractor)
-    - Eigenvalues |λ| > 1: unstable (saddle/repeller)
+    We use optimization:
+        min_h ||h - f(h, 0)||^2
     """
     
-    def __init__(self, model: BrainInspiredRNN, n_points: int = 20, 
-                 n_iters: int = 1000, lr: float = 0.1, tol: float = 1e-6):
-        """
-        Initialize the fixed point finder.
-        
-        Args:
-            model: Trained RNN model
-            n_points: Number of initial conditions to try
-            n_iters: Optimization iterations per initial condition
-            lr: Learning rate for optimization
-            tol: Tolerance for considering a point fixed
-        """
+    def __init__(
+        self, 
+        model: nn.Module, 
+        n_points: int = 20, 
+        n_iters: int = 1000, 
+        lr: float = 0.1, 
+        tol: float = 1e-6
+    ):
         self.model = model
         self.n_points = n_points
         self.n_iters = n_iters
         self.lr = lr
         self.tol = tol
         self.device = next(model.parameters()).device
-        
+    
     def _dynamics(self, h: torch.Tensor) -> torch.Tensor:
         """Single step of autonomous dynamics (no input)."""
-        x = torch.zeros(h.shape[0], self.model.input_dim, device=self.device)
-        h_new = self.model.recurrent(h, self.model.W_in(x))
+        if hasattr(self.model, 'config'):
+            n_input = self.model.config.n_input
+        else:
+            n_input = 3
+        
+        x = torch.zeros(h.shape[0], n_input, device=self.device)
+        
+        if hasattr(self.model, 'W_in') and hasattr(self.model, 'recurrent'):
+            x_transformed = self.model.W_in(x)
+            h_new = self.model.recurrent(h, x_transformed)
+        else:
+            h_new = h
+        
         return h_new
     
-    def find_fixed_points(self) -> Dict[str, np.ndarray]:
-        """
-        Find fixed points by optimization from random initial conditions.
+    def find_fixed_points(self) -> Dict[str, Union[np.ndarray, int]]:
+        """Find fixed points by optimization."""
+        if hasattr(self.model, 'config'):
+            n_hidden = self.model.config.n_hidden
+        else:
+            n_hidden = 32
         
-        Returns:
-            Dictionary containing:
-            - 'fixed_points': Array of found fixed points
-            - 'velocities': Residual velocities (should be ~0)
-            - 'stability': Stability classification
-        """
-        n_hidden = self.model.config.n_hidden
-        
-        # Generate random initial conditions
         h_init = torch.randn(self.n_points, n_hidden, device=self.device) * 0.5
         h_init.requires_grad_(True)
         
@@ -104,546 +164,928 @@ class FixedPointFinder:
         
         for _ in range(self.n_iters):
             optimizer.zero_grad()
-            
-            # Compute dynamics
-            h_next = self._dynamics(h_init)
-            
-            # Loss: ||h - f(h)||²
-            loss = ((h_init - h_next) ** 2).sum(dim=1).mean()
+            h_new = self._dynamics(h_init)
+            loss = ((h_init - h_new) ** 2).sum(dim=1).mean()
             loss.backward()
             optimizer.step()
         
-        # Filter for actual fixed points
+        # Find converged points
         with torch.no_grad():
             h_final = h_init.detach()
-            h_next = self._dynamics(h_final)
-            velocities = torch.norm(h_final - h_next, dim=1).cpu().numpy()
+            h_new = self._dynamics(h_final)
+            velocities = ((h_final - h_new) ** 2).sum(dim=1).sqrt()
             
-            # Keep points with small velocity
-            mask = velocities < self.tol
-            fixed_points = h_final[mask].cpu().numpy()
-            velocities = velocities[mask]
-        
-        # Remove duplicates
-        if len(fixed_points) > 0:
-            unique_fps = self._remove_duplicates(fixed_points)
-        else:
-            unique_fps = np.array([])
+            converged = velocities < self.tol
+            fixed_points = h_final[converged].cpu().numpy()
+            
+            # Remove duplicates
+            if len(fixed_points) > 0:
+                fixed_points = self._remove_duplicates(fixed_points)
         
         return {
-            'fixed_points': unique_fps,
-            'velocities': velocities,
-            'n_found': len(unique_fps)
+            'fixed_points': fixed_points,
+            'velocities': velocities.cpu().numpy(),
+            'n_found': len(fixed_points)
         }
     
     def _remove_duplicates(self, points: np.ndarray, threshold: float = 0.1) -> np.ndarray:
-        """Remove duplicate fixed points that are close together."""
+        """Remove duplicate fixed points."""
         if len(points) == 0:
             return points
         
         unique = [points[0]]
         for p in points[1:]:
-            is_duplicate = False
-            for u in unique:
-                if np.linalg.norm(p - u) < threshold:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
+            distances = [np.linalg.norm(p - u) for u in unique]
+            if min(distances) > threshold:
                 unique.append(p)
         
         return np.array(unique)
     
-    def compute_jacobian(self, h: torch.Tensor) -> np.ndarray:
-        """
-        Compute the Jacobian of the dynamics at a point.
+    def compute_jacobian(self, h_star: torch.Tensor) -> torch.Tensor:
+        """Compute Jacobian at a fixed point."""
+        h = h_star.clone().requires_grad_(True)
+        h_new = self._dynamics(h.unsqueeze(0)).squeeze(0)
         
-        J_ij = ∂f_i/∂h_j
-        
-        Args:
-            h: Hidden state [1, n_hidden]
-        
-        Returns:
-            Jacobian matrix [n_hidden, n_hidden]
-        """
-        h = h.clone().requires_grad_(True)
-        n_hidden = h.shape[1]
-        
+        n_hidden = h.shape[0]
         jacobian = torch.zeros(n_hidden, n_hidden, device=self.device)
         
         for i in range(n_hidden):
-            self.model.zero_grad()
-            h_next = self._dynamics(h)
-            h_next[0, i].backward(retain_graph=True)
-            jacobian[i, :] = h.grad[0, :].clone()
-            h.grad.zero_()
+            grad = torch.autograd.grad(h_new[i], h, retain_graph=True)[0]
+            jacobian[i] = grad
         
-        return jacobian.cpu().numpy()
+        return jacobian
     
-    def analyze_stability(self, fixed_point: np.ndarray) -> Dict:
-        """
-        Analyze the stability of a fixed point via Jacobian eigenvalues.
+    def analyze_stability(self, fixed_points: np.ndarray) -> List[Dict]:
+        """Analyze stability of each fixed point."""
+        stability_results = []
         
-        Args:
-            fixed_point: The fixed point to analyze
-        
-        Returns:
-            Dictionary with eigenvalue analysis
-        """
-        h = torch.tensor(fixed_point, dtype=torch.float32, 
-                        device=self.device).unsqueeze(0)
-        
-        J = self.compute_jacobian(h)
-        eigenvalues = np.linalg.eigvals(J)
-        
-        # Spectral radius determines stability
-        spectral_radius = np.max(np.abs(eigenvalues))
-        
-        # Classification
-        if spectral_radius < 1:
-            stability = 'stable'
-        elif spectral_radius > 1:
-            # Check if saddle or repeller
-            n_unstable = np.sum(np.abs(eigenvalues) > 1)
-            if n_unstable < len(eigenvalues):
-                stability = 'saddle'
+        for fp in fixed_points:
+            h_star = torch.tensor(fp, dtype=torch.float32, device=self.device)
+            J = self.compute_jacobian(h_star)
+            
+            eigenvalues = torch.linalg.eigvals(J)
+            max_abs_eig = eigenvalues.abs().max().item()
+            
+            if max_abs_eig < 1:
+                stability = "stable"
+            elif max_abs_eig > 1:
+                stability = "unstable"
             else:
-                stability = 'repeller'
-        else:
-            stability = 'neutral'
+                stability = "neutral"
+            
+            stability_results.append({
+                'fixed_point': fp,
+                'max_eigenvalue': max_abs_eig,
+                'stability': stability,
+                'eigenvalues': eigenvalues.cpu().numpy()
+            })
         
-        return {
-            'eigenvalues': eigenvalues,
-            'spectral_radius': spectral_radius,
-            'stability': stability,
-            'jacobian': J
-        }
+        return stability_results
 
+
+# =============================================================================
+# Logit Analyzer
+# =============================================================================
+
+class LogitAnalyzer:
+    """
+    Analyze RNN dynamics through logit space.
+    
+    L(t) = log(P(A1)/P(A2)) = beta * (output_1 - output_2)
+    """
+    
+    def __init__(self, model: nn.Module, inverse_temp: float = 1.0):
+        self.model = model
+        self.beta = inverse_temp
+        self.device = next(model.parameters()).device
+    
+    def compute_logit(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Compute policy logit from model outputs."""
+        if outputs.shape[-1] >= 2:
+            logit = self.beta * (outputs[..., 0] - outputs[..., 1])
+        else:
+            logit = self.beta * outputs[..., 0]
+        
+        return logit
+    
+    def extract_trajectories(
+        self, 
+        inputs: torch.Tensor, 
+        return_hidden: bool = True
+    ) -> Dict[str, torch.Tensor]:
+        """Extract logit trajectories from input sequences."""
+        self.model.eval()
+        
+        with torch.no_grad():
+            if return_hidden:
+                outputs, h_final, hidden_history = self.model(inputs, return_hidden=True)
+            else:
+                outputs, h_final = self.model(inputs)
+                hidden_history = None
+        
+        logits = self.compute_logit(outputs)
+        
+        logit_changes = torch.zeros_like(logits)
+        logit_changes[:, :-1] = logits[:, 1:] - logits[:, :-1]
+        
+        result = {
+            'logits': logits,
+            'logit_changes': logit_changes,
+            'outputs': outputs
+        }
+        
+        if hidden_history is not None:
+            result['hidden_states'] = hidden_history
+        
+        return result
+
+
+# =============================================================================
+# Phase Portrait Generator (Figure 3)
+# =============================================================================
+
+class PhasePortraitGenerator:
+    """
+    Generate phase portraits for RNN dynamics visualization.
+    
+    Following Figure 3 of Ji-An et al.:
+    - X-axis: Logit L(t)
+    - Y-axis: Logit change Delta-L(t)
+    - Colors: Input condition (action, reward)
+    """
+    
+    def __init__(self, model: nn.Module, task_name: str = "reversal"):
+        self.model = model
+        self.task_name = task_name
+        self.device = next(model.parameters()).device
+        self.analyzer = LogitAnalyzer(model)
+        
+        # Color scheme following paper
+        self.colors = {
+            0: '#ADD8E6',  # A1, R=0 (light blue)
+            1: '#00008B',  # A1, R=1 (dark blue)
+            2: '#FFC0CB',  # A2, R=0 (light pink)
+            3: '#8B0000',  # A2, R=1 (dark red)
+            # For 8-condition two-stage task
+            4: '#90EE90',  # A1, S2, R=0 (light green)
+            5: '#006400',  # A1, S2, R=1 (dark green)
+            6: '#FFD700',  # A2, S1, R=0 (light yellow)
+            7: '#FF8C00',  # A2, S1, R=1 (dark orange)
+        }
+    
+    def generate_from_data(
+        self, 
+        inputs: torch.Tensor, 
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        second_stages: Optional[np.ndarray] = None
+    ) -> PhasePortraitData:
+        """Generate phase portrait data from experimental data."""
+        trajectories = self.analyzer.extract_trajectories(inputs)
+        
+        logits = trajectories['logits'].cpu().numpy().flatten()
+        logit_changes = trajectories['logit_changes'].cpu().numpy().flatten()
+        
+        actions_flat = actions.flatten()
+        rewards_flat = rewards.flatten()
+        
+        # Compute input conditions
+        if second_stages is not None:
+            # 8 conditions for two-stage task
+            second_stages_flat = second_stages.flatten()
+            input_conditions = 4 * actions_flat + 2 * second_stages_flat + rewards_flat
+        else:
+            # 4 conditions for reversal
+            input_conditions = 2 * actions_flat + rewards_flat
+        
+        # Find fixed points
+        fixed_points = self._estimate_fixed_points(
+            logits, logit_changes, input_conditions
+        )
+        
+        # Compute preference setpoints
+        max_fp = max(abs(fp) for fp in fixed_points.values()) if fixed_points else 1.0
+        setpoints = {k: v / max_fp for k, v in fixed_points.items()}
+        
+        return PhasePortraitData(
+            logits=logits,
+            logit_changes=logit_changes,
+            actions=actions_flat,
+            rewards=rewards_flat,
+            input_conditions=input_conditions.astype(int),
+            fixed_points=fixed_points,
+            preference_setpoints=setpoints
+        )
+    
+    def _estimate_fixed_points(
+        self, 
+        logits: np.ndarray, 
+        logit_changes: np.ndarray,
+        conditions: np.ndarray,
+        n_bins: int = 20
+    ) -> Dict[int, float]:
+        """Estimate fixed points from empirical data."""
+        fixed_points = {}
+        unique_conditions = np.unique(conditions)
+        
+        for cond in unique_conditions:
+            mask = conditions == cond
+            L = logits[mask]
+            dL = logit_changes[mask]
+            
+            if len(L) < 10:
+                continue
+            
+            # Bin the data
+            bins = np.linspace(L.min(), L.max(), n_bins + 1)
+            bin_centers = (bins[:-1] + bins[1:]) / 2
+            bin_means = []
+            
+            for i in range(n_bins):
+                bin_mask = (L >= bins[i]) & (L < bins[i + 1])
+                if bin_mask.sum() > 0:
+                    bin_means.append(dL[bin_mask].mean())
+                else:
+                    bin_means.append(np.nan)
+            
+            bin_means = np.array(bin_means)
+            
+            # Find zero crossings
+            valid = ~np.isnan(bin_means)
+            if valid.sum() < 2:
+                continue
+            
+            for i in range(len(bin_means) - 1):
+                if not valid[i] or not valid[i + 1]:
+                    continue
+                if bin_means[i] * bin_means[i + 1] < 0:
+                    t = -bin_means[i] / (bin_means[i + 1] - bin_means[i])
+                    fp = bin_centers[i] + t * (bin_centers[i + 1] - bin_centers[i])
+                    fixed_points[int(cond)] = fp
+                    break
+        
+        return fixed_points
+    
+    def plot_phase_portrait(
+        self, 
+        data: PhasePortraitData,
+        ax: Optional[plt.Axes] = None,
+        title: str = "",
+        show_curves: bool = True
+    ) -> plt.Axes:
+        """Create phase portrait visualization."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 6))
+        
+        for cond in sorted(np.unique(data.input_conditions)):
+            mask = data.input_conditions == cond
+            
+            action = cond // 2 if cond < 4 else (cond - 4) // 2
+            reward = cond % 2
+            label = f"$A_{action+1}$, $R={reward}$"
+            
+            color = self.colors.get(cond, '#808080')
+            
+            ax.scatter(
+                data.logits[mask], 
+                data.logit_changes[mask],
+                c=color,
+                alpha=0.5,
+                s=10,
+                label=label
+            )
+            
+            if show_curves:
+                L = data.logits[mask]
+                dL = data.logit_changes[mask]
+                
+                sort_idx = np.argsort(L)
+                L_sorted = L[sort_idx]
+                dL_sorted = dL[sort_idx]
+                
+                if len(L_sorted) > 20:
+                    window = len(L_sorted) // 10
+                    L_smooth = np.convolve(L_sorted, np.ones(window)/window, mode='valid')
+                    dL_smooth = np.convolve(dL_sorted, np.ones(window)/window, mode='valid')
+                    
+                    ax.plot(L_smooth, dL_smooth, color=color, linewidth=2, alpha=0.8)
+        
+        # Reference lines
+        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        ax.axvline(x=0, color='gray', linestyle='--', alpha=0.5)
+        
+        # Mark fixed points
+        for cond, fp in data.fixed_points.items():
+            color = self.colors.get(cond, '#808080')
+            ax.axvline(x=fp, color=color, linestyle=':', alpha=0.7)
+            ax.scatter([fp], [0], color=color, s=100, marker='x', zorder=5)
+        
+        ax.set_xlabel('Logit $L(t)$', fontsize=12)
+        ax.set_ylabel('Logit Change $\\Delta L(t)$', fontsize=12)
+        ax.set_title(title, fontsize=14)
+        ax.legend(loc='upper right', fontsize=10)
+        
+        return ax
+
+
+# =============================================================================
+# Vector Field Generator (Figure 4) - FOR d>1 MODELS
+# =============================================================================
+
+class VectorFieldGenerator:
+    """
+    Generate vector field visualizations for d>1 models.
+    
+    Following Figure 4 of Ji-An et al.:
+    - 2D state space with h1, h2 axes
+    - Arrows show (Delta-h1, Delta-h2) for each input condition
+    """
+    
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.device = next(model.parameters()).device
+    
+    def _single_step(
+        self, 
+        h: torch.Tensor, 
+        x: torch.Tensor
+    ) -> torch.Tensor:
+        """Perform single step of dynamics."""
+        if hasattr(self.model, 'gru_cell') and self.model.gru_cell is not None:
+            return self.model.gru_cell(x, h)
+        elif hasattr(self.model, 'recurrent'):
+            if hasattr(self.model, 'W_in'):
+                x_transformed = self.model.W_in(x)
+            else:
+                x_transformed = x
+            return self.model.recurrent(h, x_transformed)
+        else:
+            return h
+    
+    def generate_vector_field(
+        self,
+        h_range: Tuple[float, float] = (-1, 1),
+        n_grid: int = 15,
+        input_conditions: List[int] = [0, 1, 2, 3],
+        n_input_dim: int = 4
+    ) -> VectorFieldData:
+        """
+        Generate vector field data on a grid of hidden states.
+        
+        Parameters
+        ----------
+        h_range : tuple
+            Range for h1, h2 values
+        n_grid : int
+            Number of grid points per dimension
+        input_conditions : list
+            List of input condition indices to compute
+        n_input_dim : int
+            Dimension of one-hot input
+        
+        Returns
+        -------
+        VectorFieldData
+            Grid and vectors for visualization
+        """
+        h_vals = np.linspace(h_range[0], h_range[1], n_grid)
+        h1_grid, h2_grid = np.meshgrid(h_vals, h_vals)
+        
+        delta_h1 = {}
+        delta_h2 = {}
+        
+        for cond in input_conditions:
+            dh1 = np.zeros((n_grid, n_grid))
+            dh2 = np.zeros((n_grid, n_grid))
+            
+            for i in range(n_grid):
+                for j in range(n_grid):
+                    # Create hidden state (assume d=2)
+                    h = torch.tensor(
+                        [[h1_grid[i, j], h2_grid[i, j]]], 
+                        dtype=torch.float32, 
+                        device=self.device
+                    )
+                    
+                    # Create one-hot input for condition
+                    x = torch.zeros(1, n_input_dim, device=self.device)
+                    x[0, cond] = 1.0
+                    
+                    with torch.no_grad():
+                        h_new = self._single_step(h, x)
+                    
+                    dh1[i, j] = (h_new[0, 0] - h[0, 0]).item()
+                    if h.shape[1] > 1:
+                        dh2[i, j] = (h_new[0, 1] - h[0, 1]).item()
+            
+            delta_h1[cond] = dh1
+            delta_h2[cond] = dh2
+        
+        return VectorFieldData(
+            h1_grid=h1_grid,
+            h2_grid=h2_grid,
+            delta_h1=delta_h1,
+            delta_h2=delta_h2,
+            fixed_points={}
+        )
+    
+    def plot_vector_field(
+        self, 
+        data: VectorFieldData,
+        condition: int,
+        ax: Optional[plt.Axes] = None,
+        title: str = ""
+    ) -> plt.Axes:
+        """Plot vector field for a specific input condition."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(6, 6))
+        
+        # Color by magnitude
+        magnitude = np.sqrt(
+            data.delta_h1[condition]**2 + data.delta_h2[condition]**2
+        )
+        
+        ax.quiver(
+            data.h1_grid, data.h2_grid,
+            data.delta_h1[condition], data.delta_h2[condition],
+            magnitude,
+            cmap='viridis',
+            alpha=0.7
+        )
+        
+        ax.set_xlabel('$h_1$ (dynamical variable 1)', fontsize=12)
+        ax.set_ylabel('$h_2$ (dynamical variable 2)', fontsize=12)
+        ax.set_title(title, fontsize=14)
+        ax.set_aspect('equal')
+        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+        ax.axvline(x=0, color='gray', linestyle='--', alpha=0.3)
+        
+        return ax
+    
+    def plot_all_conditions(
+        self, 
+        data: VectorFieldData,
+        figsize: Tuple[int, int] = (12, 10)
+    ) -> plt.Figure:
+        """Plot vector fields for all conditions."""
+        n_conditions = len(data.delta_h1)
+        n_cols = 2
+        n_rows = (n_conditions + 1) // 2
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+        axes = axes.flatten() if n_conditions > 1 else [axes]
+        
+        colors = ['blue', 'darkblue', 'red', 'darkred']
+        labels = ['A1, R=0', 'A1, R=1', 'A2, R=0', 'A2, R=1']
+        
+        for idx, cond in enumerate(sorted(data.delta_h1.keys())):
+            if idx < len(axes):
+                self.plot_vector_field(data, cond, ax=axes[idx], title=labels[idx])
+        
+        plt.tight_layout()
+        return fig
+
+
+# =============================================================================
+# Dynamics Analyzer
+# =============================================================================
 
 class DynamicsAnalyzer:
     """
-    Comprehensive analyzer for RNN dynamics and computational mechanisms.
+    Comprehensive analysis of RNN dynamics.
     
-    Provides methods to:
-    - Characterize the dynamical landscape
-    - Analyze information flow
-    - Compare computational strategies
+    Includes:
+    - Lyapunov exponent estimation
+    - Representational geometry
+    - Adaptation speed measurement
+    - Two-stage task signatures
     """
     
-    def __init__(self, model: BrainInspiredRNN):
-        """
-        Initialize the dynamics analyzer.
-        
-        Args:
-            model: Trained BrainInspiredRNN model
-        """
+    def __init__(self, model: nn.Module):
         self.model = model
         self.device = next(model.parameters()).device
-        
-    def compute_lyapunov_exponent(self, n_steps: int = 1000, 
-                                   n_trials: int = 10) -> float:
+    
+    def compute_lyapunov_exponent(
+        self, 
+        inputs: torch.Tensor,
+        n_steps: int = 1000,
+        n_trials: int = 10,
+        epsilon: float = 1e-6
+    ) -> float:
         """
-        Estimate the maximal Lyapunov exponent.
+        Estimate maximal Lyapunov exponent.
         
-        The Lyapunov exponent λ characterizes sensitivity to initial conditions:
-        - λ > 0: chaotic dynamics
-        - λ < 0: convergent dynamics (to fixed point or limit cycle)
-        - λ ≈ 0: edge of chaos
-        
-        Args:
-            n_steps: Number of time steps
-            n_trials: Number of random trials to average
-        
-        Returns:
-            Estimated maximal Lyapunov exponent
+        lambda > 0: chaotic
+        lambda < 0: convergent
+        lambda ~ 0: edge of chaos
         """
-        n_hidden = self.model.config.n_hidden
-        lyap_estimates = []
+        lyapunov_estimates = []
         
-        for _ in range(n_trials):
-            # Random initial condition and small perturbation
-            h = torch.randn(1, n_hidden, device=self.device) * 0.5
-            delta = torch.randn(1, n_hidden, device=self.device) * 1e-8
-            h_perturbed = h + delta
+        for trial in range(n_trials):
+            # Initial state
+            h = torch.randn(1, self.model.config.n_hidden, device=self.device) * 0.1
             
-            log_divergence = 0
+            # Nearby state
+            perturbation = torch.randn_like(h) * epsilon
+            perturbation = perturbation / perturbation.norm() * epsilon
+            h_perturbed = h + perturbation
             
-            for t in range(n_steps):
-                # Random input
-                x = torch.randn(1, self.model.input_dim, device=self.device) * 0.1
-                x_transformed = self.model.W_in(x)
+            lyapunov_sum = 0.0
+            
+            seq_len = min(n_steps, inputs.shape[1])
+            
+            for t in range(seq_len):
+                x_t = self.model.W_in(inputs[0:1, t, :])
                 
-                # Evolve both trajectories
-                h = self.model.recurrent(h, x_transformed)
-                h_perturbed = self.model.recurrent(h_perturbed, x_transformed)
+                h = self.model.recurrent(h, x_t)
+                h_perturbed = self.model.recurrent(h_perturbed, x_t)
                 
                 # Measure divergence
-                delta_new = h_perturbed - h
-                delta_norm = torch.norm(delta_new).item()
+                delta = (h_perturbed - h).norm().item()
                 
-                if delta_norm > 0:
-                    log_divergence += np.log(delta_norm / 1e-8)
+                if delta > 0:
+                    lyapunov_sum += np.log(delta / epsilon)
                     
-                    # Rescale perturbation to avoid saturation
-                    h_perturbed = h + delta_new / delta_norm * 1e-8
+                    # Renormalize
+                    h_perturbed = h + (h_perturbed - h) / delta * epsilon
             
-            lyap_estimates.append(log_divergence / n_steps)
+            lyapunov_estimates.append(lyapunov_sum / seq_len)
         
-        return np.mean(lyap_estimates)
+        return float(np.mean(lyapunov_estimates))
     
-    def analyze_representational_geometry(self, inputs: torch.Tensor, 
-                                          n_components: int = 3) -> Dict:
-        """
-        Analyze the geometry of neural representations using PCA.
-        
-        Args:
-            inputs: Input sequences [batch, seq_len, input_dim]
-            n_components: Number of PCA components
-        
-        Returns:
-            Dictionary with PCA results and dimensionality metrics
-        """
-        self.model.eval()
+    def analyze_representational_geometry(
+        self,
+        inputs: torch.Tensor,
+        n_components: int = 3
+    ) -> Dict[str, float]:
+        """Analyze geometry of hidden state representations."""
         with torch.no_grad():
-            _, _, hidden_history = self.model(inputs, return_hidden=True)
+            _, _, hidden_states = self.model(inputs, return_hidden=True)
         
-        # Reshape: [batch * seq_len, n_hidden]
-        hidden_flat = hidden_history.reshape(-1, self.model.config.n_hidden).cpu().numpy()
+        h_flat = hidden_states.view(-1, hidden_states.shape[-1]).cpu().numpy()
         
-        # PCA
-        pca = PCA(n_components=min(n_components, hidden_flat.shape[1]))
-        hidden_pca = pca.fit_transform(hidden_flat)
+        pca = PCA(n_components=min(n_components, h_flat.shape[1]))
+        pca.fit(h_flat)
         
-        # Participation ratio (effective dimensionality)
-        eigenvalues = pca.explained_variance_ratio_
-        participation_ratio = 1 / np.sum(eigenvalues ** 2)
+        # Participation ratio
+        explained_var = pca.explained_variance_ratio_
+        participation_ratio = 1.0 / (explained_var ** 2).sum()
         
         return {
-            'pca_coords': hidden_pca,
-            'explained_variance': pca.explained_variance_ratio_,
+            'variance_explained_top3': explained_var[:3].sum() if len(explained_var) >= 3 else explained_var.sum(),
             'participation_ratio': participation_ratio,
-            'cumulative_variance': np.cumsum(pca.explained_variance_ratio_)
+            'effective_dimensionality': participation_ratio,
+            'total_variance': h_flat.var()
         }
     
-    def measure_adaptation_speed(self, task: ReversalLearningTask, 
-                                 window: int = 10) -> Dict:
+    def analyze_two_stage_signatures(
+        self,
+        outputs: torch.Tensor,
+        actions: np.ndarray,
+        transition_types: np.ndarray,
+        rewards: np.ndarray
+    ) -> Dict[str, float]:
         """
-        Measure how quickly the model adapts after a reversal.
+        Analyze model-based vs model-free signatures.
         
-        Args:
-            task: Reversal learning task instance
-            window: Window size for measuring adaptation
-        
-        Returns:
-            Dictionary with adaptation metrics
+        Model-free: P(stay|rew) > P(stay|no_rew), independent of transition
+        Model-based: P(stay|common,rew) > P(stay|rare,rew)
         """
-        # Generate session with known reversals
-        session = task.generate_session(300, seed=123)
+        actions = actions.flatten()
+        transition_types = transition_types.flatten()
+        rewards = rewards.flatten()
         
-        # Get model predictions
-        self.model.eval()
-        inputs = torch.tensor(session.inputs, dtype=torch.float32, 
-                             device=self.device).unsqueeze(0)
-        
-        with torch.no_grad():
-            outputs, _ = self.model(inputs)
-        
-        # Get choice probabilities
-        probs = torch.softmax(outputs, dim=-1)[0].cpu().numpy()
-        
-        # Analyze adaptation around each reversal
-        reversal_trials = session.trial_info['reversal_trials']
-        adaptations = []
-        
-        for rev_trial in reversal_trials:
-            if rev_trial + window < len(probs) and rev_trial - window >= 0:
-                # Get accuracy before and after reversal
-                targets = session.targets
-                
-                # Pre-reversal accuracy
-                pre_correct = np.argmax(probs[rev_trial-window:rev_trial], axis=1) == \
-                              np.argmax(targets[rev_trial-window:rev_trial], axis=1)
-                
-                # Post-reversal accuracy (after adapting)
-                post_correct = np.argmax(probs[rev_trial:rev_trial+window], axis=1) == \
-                               np.argmax(targets[rev_trial:rev_trial+window], axis=1)
-                
-                adaptations.append({
-                    'pre_accuracy': pre_correct.mean(),
-                    'post_accuracy': post_correct.mean(),
-                    'trials_to_adapt': np.argmax(post_correct) if np.any(post_correct) else window
-                })
-        
-        if adaptations:
-            mean_adaptation = {
-                'mean_pre_accuracy': np.mean([a['pre_accuracy'] for a in adaptations]),
-                'mean_post_accuracy': np.mean([a['post_accuracy'] for a in adaptations]),
-                'mean_trials_to_adapt': np.mean([a['trials_to_adapt'] for a in adaptations])
-            }
-        else:
-            mean_adaptation = {'mean_pre_accuracy': 0, 'mean_post_accuracy': 0, 
-                              'mean_trials_to_adapt': window}
-        
-        return mean_adaptation
-    
-    def analyze_two_stage_signatures(self, task: TwoStageTask) -> Dict:
-        """
-        Analyze model-based vs model-free signatures in two-stage task.
-        
-        Key signatures:
-        - Model-free: P(stay|rewarded) > P(stay|unrewarded) regardless of transition
-        - Model-based: P(stay|rewarded, rare) < P(stay|rewarded, common)
-        
-        Args:
-            task: Two-stage task instance
-        
-        Returns:
-            Dictionary with stay probability analysis
-        """
-        # Generate sessions
-        sessions = [task.generate_session(200, seed=i) for i in range(10)]
-        
-        # Aggregate stay probabilities
-        all_stays = {
+        stay_probs = {
             'common_rewarded': [],
             'common_unrewarded': [],
             'rare_rewarded': [],
             'rare_unrewarded': []
         }
         
-        self.model.eval()
+        for t in range(len(actions) - 1):
+            stayed = int(actions[t + 1] == actions[t])
+            
+            is_common = (transition_types[t] == 0)
+            is_rewarded = (rewards[t] == 1)
+            
+            if is_common:
+                if is_rewarded:
+                    stay_probs['common_rewarded'].append(stayed)
+                else:
+                    stay_probs['common_unrewarded'].append(stayed)
+            else:
+                if is_rewarded:
+                    stay_probs['rare_rewarded'].append(stayed)
+                else:
+                    stay_probs['rare_unrewarded'].append(stayed)
         
-        for session in sessions:
-            inputs = torch.tensor(session.inputs, dtype=torch.float32,
-                                 device=self.device).unsqueeze(0)
-            
-            with torch.no_grad():
-                outputs, _ = self.model(inputs)
-            
-            # Get predicted actions
-            pred_actions = torch.argmax(outputs, dim=-1)[0].cpu().numpy()
-            transitions = session.trial_info['transitions']
-            
-            for t in range(len(session.rewards) - 1):
-                is_common = transitions[t] == 0
-                is_rewarded = session.rewards[t] > 0
-                is_stay = pred_actions[t] == pred_actions[t + 1]
-                
-                key = f"{'common' if is_common else 'rare'}_{'rewarded' if is_rewarded else 'unrewarded'}"
-                all_stays[key].append(int(is_stay))
-        
-        # Compute mean stay probabilities
-        stay_probs = {k: np.mean(v) if v else 0.5 for k, v in all_stays.items()}
+        results = {k: np.mean(v) if v else 0.5 for k, v in stay_probs.items()}
         
         # Compute indices
-        # Model-free index: (rewarded - unrewarded) averaging over transition
-        mf_common = stay_probs['common_rewarded'] - stay_probs['common_unrewarded']
-        mf_rare = stay_probs['rare_rewarded'] - stay_probs['rare_unrewarded']
-        model_free_index = (mf_common + mf_rare) / 2
+        results['mf_index'] = (
+            (results['common_rewarded'] - results['common_unrewarded'] +
+             results['rare_rewarded'] - results['rare_unrewarded']) / 2
+        )
+        results['mb_index'] = (
+            results['common_rewarded'] - results['rare_rewarded']
+        )
         
-        # Model-based index: interaction effect
-        # MB agents show: P(stay|rew,rare) < P(stay|rew,common)
-        model_based_index = (stay_probs['common_rewarded'] - stay_probs['rare_rewarded'])
-        
-        return {
-            'stay_probabilities': stay_probs,
-            'model_free_index': model_free_index,
-            'model_based_index': model_based_index
-        }
+        return results
 
 
-def compare_developmental_mechanisms(premature_model: BrainInspiredRNN,
-                                      mature_model: BrainInspiredRNN,
-                                      task_type: TaskType = TaskType.REVERSAL_LEARNING) -> Dict:
+# =============================================================================
+# Developmental Comparison Analyzer
+# =============================================================================
+
+class DevelopmentalComparisonAnalyzer:
     """
-    Comprehensive comparison of computational mechanisms between developmental stages.
-    
-    Args:
-        premature_model: Trained premature RNN
-        mature_model: Trained mature RNN
-        task_type: Type of cognitive task for analysis
-    
-    Returns:
-        Dictionary with comprehensive comparison results
+    Compare dynamical properties between premature and mature models.
     """
-    print("\n" + "=" * 60)
-    print("COMPUTATIONAL MECHANISM ANALYSIS")
-    print("=" * 60)
     
-    results = {'premature': {}, 'mature': {}}
+    def __init__(self, premature_model: nn.Module, mature_model: nn.Module):
+        self.premature = premature_model
+        self.mature = mature_model
+        
+        self.prem_phase = PhasePortraitGenerator(premature_model)
+        self.mat_phase = PhasePortraitGenerator(mature_model)
     
-    for model, name in [(premature_model, 'premature'), (mature_model, 'mature')]:
-        print(f"\nAnalyzing {name.upper()} model...")
-        analyzer = DynamicsAnalyzer(model)
+    def run_comparison(
+        self, 
+        inputs: torch.Tensor,
+        actions: np.ndarray,
+        rewards: np.ndarray
+    ) -> DevelopmentalComparison:
+        """Run comprehensive comparison."""
+        # Generate phase portrait data
+        prem_data = self.prem_phase.generate_from_data(inputs, actions, rewards)
+        mat_data = self.mat_phase.generate_from_data(inputs, actions, rewards)
         
-        # 1. Fixed point analysis
-        print("  - Finding fixed points...")
-        fp_finder = FixedPointFinder(model, n_points=30)
-        fp_results = fp_finder.find_fixed_points()
-        results[name]['n_fixed_points'] = fp_results['n_found']
+        # Extract metrics
+        prem_lr = self._compute_learning_rates(prem_data)
+        mat_lr = self._compute_learning_rates(mat_data)
         
-        # Analyze stability of found fixed points
-        if fp_results['n_found'] > 0:
-            stabilities = []
-            for fp in fp_results['fixed_points'][:5]:  # Analyze first 5
-                stability = fp_finder.analyze_stability(fp)
-                stabilities.append(stability['stability'])
-            results[name]['fixed_point_stability'] = stabilities
+        prem_stability = self._analyze_stability(prem_data)
+        mat_stability = self._analyze_stability(mat_data)
         
-        # 2. Lyapunov exponent
-        print("  - Computing Lyapunov exponent...")
-        lyap = analyzer.compute_lyapunov_exponent(n_steps=500, n_trials=5)
-        results[name]['lyapunov_exponent'] = lyap
+        prem_dim = self._compute_dimensionality(self.premature)
+        mat_dim = self._compute_dimensionality(self.mature)
         
-        # 3. Representational geometry
-        print("  - Analyzing representational geometry...")
-        test_inputs = torch.randn(10, 100, model.input_dim, 
-                                  device=next(model.parameters()).device)
-        geom = analyzer.analyze_representational_geometry(test_inputs)
-        results[name]['participation_ratio'] = geom['participation_ratio']
-        results[name]['explained_variance'] = geom['explained_variance'][:3].tolist()
+        prem_spec = self._compute_specialization(prem_data)
+        mat_spec = self._compute_specialization(mat_data)
         
-        # 4. Task-specific analysis
-        if task_type == TaskType.REVERSAL_LEARNING:
-            print("  - Analyzing reversal adaptation...")
-            task = ReversalLearningTask()
-            adaptation = analyzer.measure_adaptation_speed(task)
-            results[name]['adaptation'] = adaptation
+        return DevelopmentalComparison(
+            premature_fixed_points=prem_data.fixed_points,
+            mature_fixed_points=mat_data.fixed_points,
+            premature_setpoints=prem_data.preference_setpoints,
+            mature_setpoints=mat_data.preference_setpoints,
+            premature_learning_rates=prem_lr,
+            mature_learning_rates=mat_lr,
+            premature_stability=prem_stability,
+            mature_stability=mat_stability,
+            dimensionality_premature=prem_dim,
+            dimensionality_mature=mat_dim,
+            specialization_premature=prem_spec,
+            specialization_mature=mat_spec
+        )
+    
+    def _compute_learning_rates(self, data: PhasePortraitData) -> Dict[str, float]:
+        """Compute effective learning rate from logit change curves."""
+        learning_rates = {}
+        
+        for cond in np.unique(data.input_conditions):
+            mask = data.input_conditions == cond
+            L = data.logits[mask]
+            dL = data.logit_changes[mask]
             
-        elif task_type == TaskType.TWO_STAGE:
-            print("  - Analyzing two-stage signatures...")
-            task = TwoStageTask()
-            signatures = analyzer.analyze_two_stage_signatures(task)
-            results[name]['two_stage'] = signatures
+            if len(L) < 10:
+                continue
+            
+            neutral_mask = (np.abs(L) < 2)
+            if neutral_mask.sum() > 5:
+                slope, _, _, _, _ = stats.linregress(L[neutral_mask], dL[neutral_mask])
+                learning_rates[f'cond_{cond}'] = abs(slope)
+        
+        return learning_rates
     
-    # Summary comparison
-    print("\n" + "-" * 60)
-    print("MECHANISM COMPARISON SUMMARY")
-    print("-" * 60)
+    def _analyze_stability(self, data: PhasePortraitData) -> Dict[str, float]:
+        """Analyze stability of dynamics."""
+        return {
+            'n_fixed_points': float(len(data.fixed_points)),
+            'logit_change_variance': float(np.var(data.logit_changes)),
+            'mean_logit_magnitude': float(np.abs(data.logits).mean())
+        }
     
-    print(f"\n{'Metric':<30} {'Premature':<15} {'Mature':<15} {'Interpretation'}")
-    print("-" * 80)
+    def _compute_dimensionality(self, model: nn.Module) -> float:
+        """Compute effective dimensionality."""
+        if hasattr(model, 'compute_effective_rank'):
+            return model.compute_effective_rank()
+        return 0.0
     
-    # Fixed points
-    n_fp_prem = results['premature']['n_fixed_points']
-    n_fp_mat = results['mature']['n_fixed_points']
-    interp = "More attractors" if n_fp_prem > n_fp_mat else "Fewer attractors"
-    print(f"{'Fixed Points':<30} {n_fp_prem:<15} {n_fp_mat:<15} {interp}")
+    def _compute_specialization(self, data: PhasePortraitData) -> float:
+        """Compute specialization from setpoint variance."""
+        setpoint_values = list(data.preference_setpoints.values())
+        if len(setpoint_values) > 1:
+            return float(np.var(setpoint_values))
+        return 0.0
     
-    # Lyapunov exponent
-    lyap_prem = results['premature']['lyapunov_exponent']
-    lyap_mat = results['mature']['lyapunov_exponent']
-    interp = "More chaotic" if lyap_prem > lyap_mat else "More stable"
-    print(f"{'Lyapunov Exponent':<30} {lyap_prem:<15.4f} {lyap_mat:<15.4f} {interp}")
-    
-    # Participation ratio
-    pr_prem = results['premature']['participation_ratio']
-    pr_mat = results['mature']['participation_ratio']
-    interp = "Higher dim" if pr_prem > pr_mat else "Lower dim"
-    print(f"{'Participation Ratio':<30} {pr_prem:<15.2f} {pr_mat:<15.2f} {interp}")
-    
-    return results
+    def plot_comparison(
+        self, 
+        comparison: DevelopmentalComparison,
+        save_path: Optional[str] = None
+    ) -> plt.Figure:
+        """Create comprehensive comparison visualization."""
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # Panel A: Preference setpoints
+        ax = axes[0, 0]
+        conditions = sorted(set(comparison.premature_setpoints.keys()) | 
+                          set(comparison.mature_setpoints.keys()))
+        x = np.arange(len(conditions))
+        width = 0.35
+        
+        prem_vals = [comparison.premature_setpoints.get(c, 0) for c in conditions]
+        mat_vals = [comparison.mature_setpoints.get(c, 0) for c in conditions]
+        
+        ax.bar(x - width/2, prem_vals, width, label='Premature', color='#E74C3C')
+        ax.bar(x + width/2, mat_vals, width, label='Mature', color='#2ECC71')
+        ax.set_xticks(x)
+        ax.set_xticklabels([f'C{c}' for c in conditions])
+        ax.set_ylabel('Preference Setpoint $u_I$')
+        ax.set_title('A. Preference Setpoints')
+        ax.legend()
+        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        
+        # Panel B: Learning rates
+        ax = axes[0, 1]
+        prem_lr = list(comparison.premature_learning_rates.values())
+        mat_lr = list(comparison.mature_learning_rates.values())
+        
+        if prem_lr and mat_lr:
+            ax.bar(['Premature', 'Mature'], 
+                  [np.mean(prem_lr), np.mean(mat_lr)],
+                  color=['#E74C3C', '#2ECC71'],
+                  yerr=[np.std(prem_lr) if len(prem_lr) > 1 else 0, 
+                        np.std(mat_lr) if len(mat_lr) > 1 else 0],
+                  capsize=5)
+        ax.set_ylabel('Effective Learning Rate')
+        ax.set_title('B. Effective Learning Rates')
+        
+        # Panel C: Dimensionality
+        ax = axes[0, 2]
+        ax.bar(['Premature', 'Mature'],
+              [comparison.dimensionality_premature, comparison.dimensionality_mature],
+              color=['#E74C3C', '#2ECC71'])
+        ax.set_ylabel('Effective Rank')
+        ax.set_title('C. Dimensionality')
+        
+        # Panel D: Stability
+        ax = axes[1, 0]
+        metrics = ['n_fixed_points', 'logit_change_variance']
+        prem_stab = [comparison.premature_stability.get(m, 0) for m in metrics]
+        mat_stab = [comparison.mature_stability.get(m, 0) for m in metrics]
+        
+        x = np.arange(len(metrics))
+        ax.bar(x - width/2, prem_stab, width, label='Premature', color='#E74C3C')
+        ax.bar(x + width/2, mat_stab, width, label='Mature', color='#2ECC71')
+        ax.set_xticks(x)
+        ax.set_xticklabels(['Fixed Points', '$\\Delta L$ Var'])
+        ax.set_title('D. Stability Metrics')
+        ax.legend()
+        
+        # Panel E: Specialization
+        ax = axes[1, 1]
+        ax.bar(['Premature', 'Mature'],
+              [comparison.specialization_premature, comparison.specialization_mature],
+              color=['#E74C3C', '#2ECC71'])
+        ax.set_ylabel('Response Heterogeneity')
+        ax.set_title('E. Specialization')
+        
+        # Panel F: Summary
+        ax = axes[1, 2]
+        summary_text = (
+            f"DEVELOPMENTAL COMPARISON\n"
+            f"{'='*30}\n\n"
+            f"Dimensionality:\n"
+            f"  Premature: {comparison.dimensionality_premature:.2f}\n"
+            f"  Mature: {comparison.dimensionality_mature:.2f}\n\n"
+            f"Specialization:\n"
+            f"  Premature: {comparison.specialization_premature:.3f}\n"
+            f"  Mature: {comparison.specialization_mature:.3f}\n\n"
+            f"Key Finding:\n"
+            f"{'Mature: lower dim + higher spec' if comparison.dimensionality_mature < comparison.dimensionality_premature and comparison.specialization_mature > comparison.specialization_premature else 'Analysis ongoing'}"
+        )
+        ax.text(0.1, 0.5, summary_text, transform=ax.transAxes,
+               fontsize=10, verticalalignment='center',
+               fontfamily='monospace')
+        ax.axis('off')
+        ax.set_title('F. Summary')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            fig.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+        
+        return fig
 
 
-def plot_mechanism_comparison(results: Dict, save_path: Optional[str] = None) -> plt.Figure:
-    """
-    Create visualization of mechanism comparison.
-    
-    Args:
-        results: Results from compare_developmental_mechanisms
-        save_path: Optional path to save figure
-    
-    Returns:
-        Matplotlib figure
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-    
-    colors = {'premature': '#E74C3C', 'mature': '#2ECC71'}
-    
-    # Panel A: Lyapunov exponents
-    ax = axes[0, 0]
-    lyap_vals = [results['premature']['lyapunov_exponent'], 
-                 results['mature']['lyapunov_exponent']]
-    bars = ax.bar(['Premature', 'Mature'], lyap_vals, 
-                  color=[colors['premature'], colors['mature']],
-                  edgecolor='black')
-    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-    ax.set_ylabel('Lyapunov Exponent $\\lambda$')
-    ax.set_title('A. Dynamical Stability')
-    for bar, val in zip(bars, lyap_vals):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                f'{val:.3f}', ha='center', va='bottom', fontsize=10)
-    
-    # Panel B: Participation ratio
-    ax = axes[0, 1]
-    pr_vals = [results['premature']['participation_ratio'],
-               results['mature']['participation_ratio']]
-    bars = ax.bar(['Premature', 'Mature'], pr_vals,
-                  color=[colors['premature'], colors['mature']],
-                  edgecolor='black')
-    ax.set_ylabel('Participation Ratio')
-    ax.set_title('B. Representational Dimensionality')
-    for bar, val in zip(bars, pr_vals):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                f'{val:.2f}', ha='center', va='bottom', fontsize=10)
-    
-    # Panel C: Explained variance
-    ax = axes[1, 0]
-    x = np.arange(1, 4)
-    width = 0.35
-    ev_prem = results['premature']['explained_variance']
-    ev_mat = results['mature']['explained_variance']
-    ax.bar(x - width/2, ev_prem, width, label='Premature', color=colors['premature'])
-    ax.bar(x + width/2, ev_mat, width, label='Mature', color=colors['mature'])
-    ax.set_xlabel('Principal Component')
-    ax.set_ylabel('Explained Variance')
-    ax.set_title('C. Variance Distribution')
-    ax.set_xticks(x)
-    ax.legend()
-    
-    # Panel D: Fixed points
-    ax = axes[1, 1]
-    fp_vals = [results['premature']['n_fixed_points'],
-               results['mature']['n_fixed_points']]
-    bars = ax.bar(['Premature', 'Mature'], fp_vals,
-                  color=[colors['premature'], colors['mature']],
-                  edgecolor='black')
-    ax.set_ylabel('Number of Fixed Points')
-    ax.set_title('D. Attractor Landscape')
-    for bar, val in zip(bars, fp_vals):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                f'{val}', ha='center', va='bottom', fontsize=10)
-    
-    plt.tight_layout()
-    
-    if save_path:
-        fig.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
-    
-    return fig
-
+# =============================================================================
+# Testing
+# =============================================================================
 
 if __name__ == "__main__":
-    print("Testing Analysis Module")
-    print("=" * 50)
+    print("=" * 70)
+    print("Comprehensive Dynamical Analysis Module Testing")
+    print("=" * 70)
+    
+    # Create simple test model
+    class SimpleRNN(nn.Module):
+        def __init__(self, hidden_size=2):
+            super().__init__()
+            self.hidden_size = hidden_size
+            self.n_input = 4
+            self.cell = nn.GRUCell(4, hidden_size)
+            self.W_in = nn.Linear(3, 4)  # Dummy
+            self.recurrent = self  # Self-reference for compatibility
+            self.output_layer = nn.Linear(hidden_size, 2)
+            
+            # Dummy config
+            class Config:
+                n_hidden = hidden_size
+                n_input = 3
+            self.config = Config()
+        
+        def forward(self, inputs, return_hidden=False):
+            batch, seq_len, _ = inputs.shape
+            h = torch.zeros(batch, self.hidden_size)
+            
+            outputs = []
+            hiddens = []
+            
+            for t in range(seq_len):
+                h = self.cell(inputs[:, t, :].repeat(1, 2)[:, :4], h)
+                y = self.output_layer(h)
+                outputs.append(y)
+                hiddens.append(h)
+            
+            outputs = torch.stack(outputs, dim=1)
+            
+            if return_hidden:
+                return outputs, h, torch.stack(hiddens, dim=1)
+            return outputs, h
+        
+        def get_weight_matrix(self):
+            return self.cell.weight_hh
+        
+        def compute_effective_rank(self):
+            W = self.cell.weight_hh
+            _, S, _ = torch.linalg.svd(W, full_matrices=False)
+            S_sq = S ** 2
+            return float((S_sq.sum() ** 2) / (S_sq ** 2).sum())
     
     # Create test models
-    from brain_inspired_rnn import create_premature_config, create_mature_config
+    print("\n1. Creating test models...")
+    premature_model = SimpleRNN(hidden_size=2)
+    mature_model = SimpleRNN(hidden_size=2)
     
-    premature_config = create_premature_config(n_hidden=16)
-    mature_config = create_mature_config(n_hidden=16)
+    # Test data
+    print("\n2. Generating test data...")
+    batch_size, seq_len = 100, 50
+    inputs = torch.randn(batch_size, seq_len, 4)
+    inputs = F.softmax(inputs, dim=-1)
     
-    premature_model = BrainInspiredRNN(3, 2, premature_config)
-    mature_model = BrainInspiredRNN(3, 2, mature_config)
+    actions = np.random.randint(0, 2, (batch_size, seq_len))
+    rewards = np.random.randint(0, 2, (batch_size, seq_len))
     
-    # Test fixed point finder
-    print("\nTesting Fixed Point Finder...")
-    fp_finder = FixedPointFinder(premature_model, n_points=10, n_iters=500)
+    # Test PhasePortraitGenerator
+    print("\n3. Testing PhasePortraitGenerator...")
+    phase_gen = PhasePortraitGenerator(premature_model)
+    phase_data = phase_gen.generate_from_data(inputs, actions, rewards)
+    print(f"  Fixed points found: {phase_data.fixed_points}")
+    print(f"  Preference setpoints: {phase_data.preference_setpoints}")
+    
+    # Test VectorFieldGenerator
+    print("\n4. Testing VectorFieldGenerator...")
+    vector_gen = VectorFieldGenerator(premature_model)
+    vf_data = vector_gen.generate_vector_field(n_grid=5)
+    print(f"  Grid shape: {vf_data.h1_grid.shape}")
+    print(f"  Conditions computed: {list(vf_data.delta_h1.keys())}")
+    
+    # Test FixedPointFinder
+    print("\n5. Testing FixedPointFinder...")
+    fp_finder = FixedPointFinder(premature_model, n_points=5, n_iters=100)
     fp_results = fp_finder.find_fixed_points()
-    print(f"  Found {fp_results['n_found']} fixed points")
+    print(f"  Fixed points found: {fp_results['n_found']}")
     
-    # Test dynamics analyzer
-    print("\nTesting Dynamics Analyzer...")
-    analyzer = DynamicsAnalyzer(premature_model)
-    lyap = analyzer.compute_lyapunov_exponent(n_steps=200, n_trials=3)
-    print(f"  Lyapunov exponent: {lyap:.4f}")
+    # Test comparison
+    print("\n6. Testing Developmental Comparison...")
+    comparator = DevelopmentalComparisonAnalyzer(premature_model, mature_model)
+    comparison = comparator.run_comparison(inputs, actions, rewards)
     
-    print("\n✓ Analysis module tests complete!")
+    print(f"  Premature dimensionality: {comparison.dimensionality_premature:.2f}")
+    print(f"  Mature dimensionality: {comparison.dimensionality_mature:.2f}")
+    print(f"  Premature specialization: {comparison.specialization_premature:.4f}")
+    print(f"  Mature specialization: {comparison.specialization_mature:.4f}")
+    
+    print("\n" + "=" * 70)
+    print("All dynamical analysis tests passed!")
+    print("=" * 70)

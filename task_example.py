@@ -1,9 +1,9 @@
-from brain_inspired_rnn import (
+from History.brain_inspired_rnn import (
     create_premature_config, create_mature_config,
     BrainInspiredRNN
 
 )
-from cognitive_tasks import TaskType, TaskDataset
+from History.cognitive_tasks import TaskType, TaskDataset
 from visualization import create_comprehensive_figure
 from training import run_developmental_comparison
 

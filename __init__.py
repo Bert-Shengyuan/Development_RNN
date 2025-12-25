@@ -41,28 +41,12 @@ Usage:
     python main.py --all_tasks --output_dir ./results
 """
 
-from .brain_inspired_rnn import (
-    DevelopmentalConfig,
-    create_premature_config,
-    create_mature_config,
-    LowRankRecurrentLayer,
-    BrainInspiredRNN,
-    TinyGRU,
-    get_model_metrics,
-    compute_effective_rank,
-    compute_nuclear_norm,
-    compute_response_heterogeneity
-)
-
-from .cognitive_tasks import (
+from History.cognitive_tasks import (
     TaskType,
     ReversalLearningTask,
     TwoStageTask,
     ProbabilisticRewardTask,
-    TaskDataset,
-    generate_reversal_session,
-    generate_two_stage_session,
-    generate_probabilistic_session
+    TaskDataset
 )
 
 from .training import (
@@ -75,20 +59,13 @@ from .training import (
 from .visualization import (
     COLORS,
     create_comprehensive_figure,
-    generate_all_figures,
-    plot_learning_curves,
-    plot_singular_value_spectra,
-    plot_effective_rank_comparison,
-    plot_response_heterogeneity,
-    plot_task_performance_comparison
+    generate_all_figures
 )
 
-from .analysis import (
+from History.analysis import (
     FixedPointFinder,
     DynamicsAnalyzer,
-    compare_developmental_mechanisms,
-    compute_jacobian,
-    analyze_fixed_point_structure
+    compare_developmental_mechanisms
 )
 
 __version__ = "1.0.0"
