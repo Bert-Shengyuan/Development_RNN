@@ -344,28 +344,28 @@ class Trainer:
         
         with torch.no_grad():
             inputs, targets, _ = self.dataset.get_batch(
-                len(self.test_idx), 
+                len(self.test_idx),
                 self.test_idx,
                 device=torch.device(self.config.device)
             )
-            
+
             outputs, h_final = self.model(inputs)
-            
+
             test_loss = compute_negative_log_likelihood(outputs, targets).item()
             test_accuracy = compute_choice_accuracy(outputs, targets)
-            
-            # Core metrics
-            metrics = {
-                'loss': test_loss,
-                'accuracy': test_accuracy
-            }
-            
-            # Additional metrics for BrainInspiredRNN
-            if isinstance(self.model, BrainInspiredRNN):
-                metrics['effective_rank'] = self.model.compute_effective_rank()
-                metrics['response_heterogeneity'] = (
-                    self.model.compute_jacobian_heterogeneity(h_final)
-                )
+
+        # Core metrics
+        metrics = {
+            'loss': test_loss,
+            'accuracy': test_accuracy
+        }
+
+        # Additional metrics for BrainInspiredRNN (require gradients)
+        if isinstance(self.model, BrainInspiredRNN):
+            metrics['effective_rank'] = self.model.compute_effective_rank()
+            metrics['response_heterogeneity'] = (
+                self.model.compute_jacobian_heterogeneity(h_final)
+            )
         
         return metrics
     

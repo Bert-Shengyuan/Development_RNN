@@ -1043,30 +1043,32 @@ class BrainInspiredRNN(nn.Module):
         float
             Variance of Jacobian norms across units
         """
-        h = h.detach().requires_grad_(True)
-        n_hidden = h.shape[-1]
-        device = h.device
-
         if not hasattr(self.recurrent, 'forward'):
             return 0.0
 
-        jacobian_norms = []
+        # Enable gradients for Jacobian computation
+        with torch.enable_grad():
+            h = h.detach().requires_grad_(True)
+            n_hidden = h.shape[-1]
+            device = h.device
 
-        for j in range(n_hidden):
-            I_j = torch.zeros(1, n_hidden, device=device)
-            I_j[0, j] = 1.0
+            jacobian_norms = []
 
-            h_sample = h[0:1].detach().requires_grad_(True)
-            x_zero = torch.zeros(1, n_hidden, device=device)
+            for j in range(n_hidden):
+                I_j = torch.zeros(1, n_hidden, device=device)
+                I_j[0, j] = 1.0
 
-            h_next = self.recurrent(h_sample, x_zero + I_j)
+                h_sample = h[0:1].detach().requires_grad_(True)
+                x_zero = torch.zeros(1, n_hidden, device=device)
 
-            jacobian_col = torch.autograd.grad(
-                h_next.sum(), h_sample, create_graph=False
-            )[0]
+                h_next = self.recurrent(h_sample, x_zero + I_j)
 
-            norm = jacobian_col.norm().item()
-            jacobian_norms.append(norm)
+                jacobian_col = torch.autograd.grad(
+                    h_next.sum(), h_sample, create_graph=False
+                )[0]
+
+                norm = jacobian_col.norm().item()
+                jacobian_norms.append(norm)
 
         return float(np.var(jacobian_norms)) if jacobian_norms else 0.0
 
