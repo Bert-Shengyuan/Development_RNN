@@ -119,24 +119,24 @@ from brain_inspired_rnn import (
     CellType,
     create_premature_config,
     create_mature_config,
-    
+
     # Factory function
     create_model,
-    
+
     # Main model
     BrainInspiredRNN,
-    
+
     # Layer components
     LowRankLinear,
     SVDLowRankLayer,
     EigenConstrainedLayer,
     SLINLayer,
-    
+
     # Cell types
     DevGRUCell,
     SwitchingDevGRUCell,
     SLINCell,
-    
+
     # Analysis tools
     ResponseHeterogeneityAnalyzer,
 )
@@ -210,7 +210,23 @@ from visualization import (
     COLORS,
     PHASE_COLORS,
 )
+# =============================================================================
+# Training Imports
+# =============================================================================
 
+from training import (
+    TrainingConfig,
+    Trainer,
+    run_developmental_comparison,
+    analyze_learning_dynamics,
+    save_model_checkpoint,
+    load_model_checkpoint
+)
+
+from brain_inspired_rnn import BrainInspiredRNN, create_mature_config
+from cognitive_tasks import TaskType, TaskDataset
+from training import Trainer, run_developmental_comparison
+from visualization import create_comprehensive_figure
 # =============================================================================
 # Public API
 # =============================================================================
@@ -219,26 +235,21 @@ __all__ = [
     # Version info
     "__version__",
     "__author__",
-    
-    # Configuration
-    "DevelopmentalConfig",
-    "FactorizationType", 
-    "CellType",
-    "create_premature_config",
-    "create_mature_config",
-    
+
+    'DevelopmentalConfig',
+    'FactorizationType',
+    'CellType',
+    'create_premature_config',
+    'create_mature_config',
+
     # Models
-    "BrainInspiredRNN",
-    "create_model",
-    "LowRankLinear",
-    "SVDLowRankLayer",
-    "EigenConstrainedLayer",
-    "SLINLayer",
-    "DevGRUCell",
-    "SwitchingDevGRUCell",
-    "SLINCell",
-    "ResponseHeterogeneityAnalyzer",
-    
+    'BrainInspiredRNN',
+    'TinyGRU',  # ✓ Now exported
+    'create_model',
+
+    # Utilities
+    'get_model_metrics',  # ✓ Now exported
+
     # Tasks
     "TaskType",
     "TrialData",

@@ -46,10 +46,15 @@ import time
 from collections import defaultdict
 
 from brain_inspired_rnn import (
-    BrainInspiredRNN, TinyGRU,
-    create_premature_config, create_mature_config,
-    DevelopmentalConfig, get_model_metrics
+    BrainInspiredRNN,
+    TinyGRU,  # ✓ Now correctly available
+    create_premature_config,
+    create_mature_config,
+    DevelopmentalConfig,
+    get_model_metrics  # ✓ Now correctly available
 )
+
+
 from cognitive_tasks import (
     TaskDataset, TaskType, 
     compute_choice_accuracy, compute_negative_log_likelihood
@@ -522,7 +527,7 @@ def run_developmental_comparison(
     print("-" * 70)
     
     premature_config = create_premature_config(n_hidden)
-    premature_model = BrainInspiredRNN(input_dim, output_dim, premature_config)
+    premature_model = BrainInspiredRNN(premature_config)
     premature_trainer = Trainer(premature_model, dataset, train_config)
     premature_history = premature_trainer.train(verbose=True)
     premature_test = premature_trainer.test()

@@ -1061,6 +1061,167 @@ class BrainInspiredRNN(nn.Module):
         }
 
 
+class TinyGRU(nn.Module):
+    """
+    Minimal GRU model following Ji-An et al. architecture.
+
+    This serves as a baseline comparison without developmental constraints.
+
+    Architecture:
+        - GRU cell with small hidden dimension (d=4 as in the paper)
+        - Linear readout layer
+
+    Parameters
+    ----------
+    input_dim : int
+        Dimension of input features
+    hidden_dim : int
+        Number of hidden units (typically 2-4 for interpretability)
+    output_dim : int
+        Dimension of output (typically 2 for binary choice)
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.input_dim = input_dim
+
+        # GRU cell
+        self.gru = nn.GRUCell(input_dim, hidden_dim)
+
+        # Output layer
+        self.readout = nn.Linear(hidden_dim, output_dim)
+
+        # Initial hidden state (learnable)
+        self.h0 = nn.Parameter(torch.zeros(1, hidden_dim))
+
+    def forward(
+            self,
+            inputs: torch.Tensor,
+            h0: Optional[torch.Tensor] = None,
+            return_hidden: bool = False
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Forward pass through the network.
+
+        Parameters
+        ----------
+        inputs : torch.Tensor
+            Input tensor of shape [batch, seq_len, input_dim]
+        h0 : torch.Tensor, optional
+            Initial hidden state [batch, hidden_dim]
+        return_hidden : bool
+            Whether to return hidden state history
+
+        Returns
+        -------
+        outputs : torch.Tensor
+            Output logits [batch, seq_len, output_dim]
+        h_final : torch.Tensor
+            Final hidden state [batch, hidden_dim]
+        hidden_history : torch.Tensor, optional
+            All hidden states [batch, seq_len, hidden_dim]
+        """
+        batch_size, seq_len, _ = inputs.shape
+        device = inputs.device
+
+        # Initialize hidden state
+        if h0 is None:
+            h = self.h0.expand(batch_size, -1).contiguous()
+        else:
+            h = h0
+
+        outputs = []
+        hidden_states = []
+
+        for t in range(seq_len):
+            h = self.gru(inputs[:, t, :], h)
+            y = self.readout(h)
+            outputs.append(y)
+
+            if return_hidden:
+                hidden_states.append(h)
+
+        outputs = torch.stack(outputs, dim=1)
+
+        if return_hidden:
+            hidden_history = torch.stack(hidden_states, dim=1)
+            return outputs, h, hidden_history
+
+        return outputs, h
+
+
+def get_model_metrics(model: nn.Module) -> Dict:
+    """
+    Extract comprehensive metrics from a trained model.
+
+    For BrainInspiredRNN, computes:
+        - Effective rank D(W)
+        - Singular value decay rate γ
+        - Spectral radius ρ(W)
+        - Full singular value spectrum
+
+    For TinyGRU, computes basic GRU weight statistics.
+
+    Parameters
+    ----------
+    model : nn.Module
+        The trained RNN model
+
+    Returns
+    -------
+    Dict
+        Dictionary containing all computed metrics
+    """
+    metrics = {}
+
+    if isinstance(model, BrainInspiredRNN):
+        # Get metrics from the model's built-in methods
+        metrics['effective_rank'] = model.compute_effective_rank()
+        metrics['sv_decay_rate'] = model.compute_sv_decay_rate()
+        metrics['spectral_radius'] = model.compute_spectral_radius()
+
+        # Extract singular values for visualization
+        if hasattr(model.recurrent, 'get_weight_matrix'):
+            W = model.recurrent.get_weight_matrix()
+            _, S, _ = torch.linalg.svd(W, full_matrices=False)
+            S = S.detach().cpu().numpy()
+            S_normalized = S / S[0] if S[0] > 0 else S
+            metrics['singular_values'] = S_normalized
+        else:
+            metrics['singular_values'] = np.array([1.0])
+
+        # Get model configuration info
+        model_info = model.get_model_metrics()
+        metrics.update(model_info)
+
+    elif isinstance(model, TinyGRU):
+        # For baseline GRU, compute basic statistics
+        W_hh = model.gru.weight_hh.detach()
+        _, S, _ = torch.linalg.svd(W_hh, full_matrices=False)
+        S = S.cpu().numpy()
+
+        metrics['effective_rank'] = float(
+            (S.sum() ** 2) / (S ** 2).sum()
+        )
+
+        # Decay rate from log-linear fit
+        S_pos = S[S > 1e-10]
+        if len(S_pos) > 1:
+            log_S = np.log(S_pos)
+            indices = np.arange(len(S_pos))
+            slope, _ = np.polyfit(indices, log_S, 1)
+            metrics['sv_decay_rate'] = float(-slope)
+        else:
+            metrics['sv_decay_rate'] = 0.0
+
+        S_normalized = S / S[0] if S[0] > 0 else S
+        metrics['singular_values'] = S_normalized
+        metrics['spectral_radius'] = float(np.abs(np.linalg.eigvals(W_hh.cpu().numpy())).max())
+        metrics['developmental_stage'] = 'baseline'
+        metrics['cell_type'] = 'gru'
+
+    return metrics
 # =============================================================================
 # Model Factory Functions
 # =============================================================================
