@@ -362,9 +362,9 @@ class Trainer:
             
             # Additional metrics for BrainInspiredRNN
             if isinstance(self.model, BrainInspiredRNN):
-                metrics['effective_rank'] = self.model.compute_effective_rank().item()
+                metrics['effective_rank'] = self.model.compute_effective_rank()
                 metrics['response_heterogeneity'] = (
-                    self.model.compute_response_heterogeneity(h_final).item()
+                    self.model.compute_jacobian_heterogeneity(h_final)
                 )
         
         return metrics
