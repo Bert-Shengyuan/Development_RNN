@@ -1021,10 +1021,55 @@ class BrainInspiredRNN(nn.Module):
             W = self.recurrent.get_weight_matrix()
         else:
             return 0.0
-        
+
         eigenvalues = torch.linalg.eigvals(W)
         return float(eigenvalues.abs().max().item())
-    
+
+    def compute_jacobian_heterogeneity(self, h: torch.Tensor) -> float:
+        """
+        Compute heterogeneity via Jacobian analysis.
+
+        Heterogeneity = Var_j(||dh/dI_j||_2)
+
+        Higher values -> more specialized responses (mature characteristic).
+
+        Parameters
+        ----------
+        h : torch.Tensor
+            Hidden state tensor [batch, n_hidden]
+
+        Returns
+        -------
+        float
+            Variance of Jacobian norms across units
+        """
+        h = h.detach().requires_grad_(True)
+        n_hidden = h.shape[-1]
+        device = h.device
+
+        if not hasattr(self.recurrent, 'forward'):
+            return 0.0
+
+        jacobian_norms = []
+
+        for j in range(n_hidden):
+            I_j = torch.zeros(1, n_hidden, device=device)
+            I_j[0, j] = 1.0
+
+            h_sample = h[0:1].detach().requires_grad_(True)
+            x_zero = torch.zeros(1, n_hidden, device=device)
+
+            h_next = self.recurrent(h_sample, x_zero + I_j)
+
+            jacobian_col = torch.autograd.grad(
+                h_next.sum(), h_sample, create_graph=False
+            )[0]
+
+            norm = jacobian_col.norm().item()
+            jacobian_norms.append(norm)
+
+        return float(np.var(jacobian_norms)) if jacobian_norms else 0.0
+
     def compute_regularization_losses(self, h: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute all regularization losses for training."""
         losses = {}
