@@ -353,19 +353,19 @@ class Trainer:
 
             test_loss = compute_negative_log_likelihood(outputs, targets).item()
             test_accuracy = compute_choice_accuracy(outputs, targets)
+        # Additional metrics for BrainInspiredRNN (require gradients)
 
-        # Core metrics
-        metrics = {
             'loss': test_loss,
             'accuracy': test_accuracy
         }
-
-        # Additional metrics for BrainInspiredRNN (require gradients)
         if isinstance(self.model, BrainInspiredRNN):
             metrics['effective_rank'] = self.model.compute_effective_rank()
             metrics['response_heterogeneity'] = (
                 self.model.compute_jacobian_heterogeneity(h_final)
             )
+        metrics = {
+        # Core metrics
+
         
         return metrics
     
