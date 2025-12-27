@@ -530,6 +530,7 @@ def run_developmental_comparison(
     premature_metrics = get_model_metrics(premature_model)
 
     results['premature'] = {
+        'model': premature_model,  # Store model for visualization
         'history': premature_history,
         'test_metrics': premature_test,
         'model_metrics': premature_metrics,
@@ -562,6 +563,7 @@ def run_developmental_comparison(
     mature_metrics = get_model_metrics(mature_model)
     
     results['mature'] = {
+        'model': mature_model,  # Store model for visualization
         'history': mature_history,
         'test_metrics': mature_test,
         'model_metrics': mature_metrics,
@@ -594,6 +596,7 @@ def run_developmental_comparison(
     gru_metrics = get_model_metrics(gru_model)
     
     results['baseline_gru'] = {
+        'model': gru_model,  # Store model for visualization
         'history': gru_history,
         'test_metrics': gru_test,
         'model_metrics': gru_metrics
