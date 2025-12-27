@@ -354,7 +354,7 @@ class Trainer:
             test_loss = compute_negative_log_likelihood(outputs, targets).item()
             test_accuracy = compute_choice_accuracy(outputs, targets)
         # Additional metrics for BrainInspiredRNN (require gradients)
-
+        metrics = {
             'loss': test_loss,
             'accuracy': test_accuracy
         }
@@ -363,21 +363,17 @@ class Trainer:
             metrics['response_heterogeneity'] = (
                 self.model.compute_jacobian_heterogeneity(h_final)
             )
-        metrics = {
-        # Core metrics
-
-        
         return metrics
-    
+
     def train(self, verbose: bool = True) -> Dict[str, List[float]]:
         """
         Full training loop.
-        
+
         Parameters
         ----------
         verbose : bool
             Whether to print progress
-        
+
         Returns
         -------
         Dict[str, List[float]]
@@ -386,36 +382,36 @@ class Trainer:
             - 'val_loss', 'val_accuracy'
         """
         start_time = time.time()
-        
+
         for epoch in range(self.config.n_epochs):
             # Training
             train_losses = self.train_epoch(epoch)
-            
+
             # Validation
             val_loss, val_accuracy = self.validate()
-            
+
             # Update learning rate
             self.scheduler.step()
-            
+
             # Record history
             for name, value in train_losses.items():
                 self.history[f'train_{name}'].append(value)
             self.history['val_loss'].append(val_loss)
             self.history['val_accuracy'].append(val_accuracy)
-            
+
             # Early stopping check
             if val_loss < self.best_val_loss - self.config.min_delta:
                 self.best_val_loss = val_loss
                 self.best_model_state = {
-                    k: v.cpu().clone() 
+                    k: v.cpu().clone()
                     for k, v in self.model.state_dict().items()
                 }
                 self.patience_counter = 0
             else:
                 self.patience_counter += 1
-            
+
             # Logging
-            if verbose and (epoch % self.config.log_interval == 0 or 
+            if verbose and (epoch % self.config.log_interval == 0 or
                            epoch == self.config.n_epochs - 1):
                 elapsed = time.time() - start_time
                 print(
@@ -425,17 +421,17 @@ class Trainer:
                     f"Val Acc: {val_accuracy:.3f} | "
                     f"Time: {elapsed:.1f}s"
                 )
-            
+
             # Early stopping
             if self.patience_counter >= self.config.patience:
                 if verbose:
                     print(f"Early stopping at epoch {epoch}")
                 break
-        
+
         # Restore best model
         if self.best_model_state is not None:
             self.model.load_state_dict(self.best_model_state)
-        
+
         return dict(self.history)
 
 
@@ -453,13 +449,13 @@ def run_developmental_comparison(
 ) -> Dict:
     """
     Run a full comparison between premature and mature brain-inspired RNNs.
-    
+
     This is the main experiment function that:
         1. Creates datasets for the cognitive task
         2. Trains premature and mature RNNs
         3. Trains a baseline GRU for comparison
         4. Compares performance and structural metrics
-    
+
     Parameters
     ----------
     task_type : TaskType
@@ -474,7 +470,7 @@ def run_developmental_comparison(
         Training epochs
     seed : int
         Random seed
-    
+
     Returns
     -------
     Dict
@@ -482,9 +478,9 @@ def run_developmental_comparison(
         - 'premature': Results for premature RNN
         - 'mature': Results for mature RNN
         - 'baseline_gru': Results for baseline GRU
-        
+
         Each contains 'history', 'test_metrics', 'model_metrics', 'config'
-    
+
     Examples
     --------
     >>> results = run_developmental_comparison(
@@ -500,66 +496,66 @@ def run_developmental_comparison(
     print(f"Sessions: {n_sessions}, Trials/session: {trials_per_session}")
     print(f"Hidden units: {n_hidden}, Epochs: {n_epochs}")
     print()
-    
+
     # Set seeds
     torch.manual_seed(seed)
     np.random.seed(seed)
-    
+
     # Create dataset
     dataset = TaskDataset(task_type, n_sessions, trials_per_session, seed)
     input_dim = dataset.input_dim
     output_dim = dataset.output_dim
-    
+
     # Training configuration
     train_config = TrainingConfig(
         n_epochs=n_epochs,
         batch_size=16,
         learning_rate=1e-3
     )
-    
+
     results = {}
-    
+
     # -------------------------------------------------------------------------
     # 1. Train Premature RNN
     # -------------------------------------------------------------------------
     print("-" * 70)
     print("Training PREMATURE Brain-Inspired RNN")
     print("-" * 70)
-    
+
     premature_config = create_premature_config(n_hidden)
     premature_model = BrainInspiredRNN(premature_config)
     premature_trainer = Trainer(premature_model, dataset, train_config)
     premature_history = premature_trainer.train(verbose=True)
     premature_test = premature_trainer.test()
     premature_metrics = get_model_metrics(premature_model)
-    
+
     results['premature'] = {
         'history': premature_history,
         'test_metrics': premature_test,
         'model_metrics': premature_metrics,
         'config': premature_config
     }
-    
+
     print(f"\nPremature Test Results:")
     print(f"  Accuracy: {premature_test['accuracy']:.4f}")
     print(f"  Loss: {premature_test['loss']:.4f}")
     print(f"  Effective Rank: {premature_test['effective_rank']:.3f}")
     print(f"  Response Heterogeneity: {premature_test['response_heterogeneity']:.4f}")
-    
+
     # -------------------------------------------------------------------------
     # 2. Train Mature RNN
     # -------------------------------------------------------------------------
     print("\n" + "-" * 70)
     print("Training MATURE Brain-Inspired RNN")
     print("-" * 70)
-    
+
     # Reset seeds for fair comparison
     torch.manual_seed(seed)
     np.random.seed(seed)
     dataset = TaskDataset(task_type, n_sessions, trials_per_session, seed)
-    
+
     mature_config = create_mature_config(n_hidden)
-    mature_model = BrainInspiredRNN(input_dim, output_dim, mature_config)
+    mature_model = BrainInspiredRNN(mature_config)
     mature_trainer = Trainer(mature_model, dataset, train_config)
     mature_history = mature_trainer.train(verbose=True)
     mature_test = mature_trainer.test()
