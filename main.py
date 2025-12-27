@@ -66,53 +66,151 @@ from cognitive_tasks import TaskType, TaskDataset
 from training import (
     TrainingConfig,
     Trainer,
-    run_developmental_comparison
+    run_developmental_comparison,
+    analyze_learning_dynamics  # Use training.py's version
 )
 
 from visualization import generate_all_figures
 
+from analysis import (
+    PhasePortraitGenerator,
+    VectorFieldGenerator,
+    DynamicsAnalyzer,
+    DevelopmentalComparisonAnalyzer
+)
+
 # =============================================================================
-# Baseline GRU Model (for comparison with Ji-An et al.)
-# =============================================================================
-# =============================================================================
-# Model Metrics Extraction
+# Dynamical Systems Analysis Integration
 # =============================================================================
 
-def analyze_learning_dynamics(results: dict) -> dict:
+def run_dynamical_analysis(
+    results: dict,
+    dataset: TaskDataset,
+    output_dir: str,
+    verbose: bool = True
+) -> dict:
     """
-    Analyze the learning dynamics of trained models.
-    
-    Computes:
-        - Learning curve statistics
-        - Convergence rates
-        - Stability metrics
+    Run comprehensive dynamical systems analysis on trained models.
+
+    Integrates analysis.py functions:
+    - Phase portrait generation
+    - Developmental comparison
+    - Fixed point analysis
+
+    Parameters
+    ----------
+    results : dict
+        Results from run_developmental_comparison containing trained models
+    dataset : TaskDataset
+        Dataset used for generating test data
+    output_dir : str
+        Directory to save analysis figures
+    verbose : bool
+        Whether to print progress
+
+    Returns
+    -------
+    dict
+        Dictionary with analysis results
     """
-    analysis = {}
-    
-    for model_name in ['premature', 'mature', 'baseline_gru']:
-        if model_name not in results:
-            continue
-            
-        history = results[model_name]['history']
-        
-        train_loss = np.array(history['train_total'])
-        val_loss = np.array(history['val_loss'])
-        val_acc = np.array(history['val_accuracy'])
-        
-        model_analysis = {
-            'final_train_loss': train_loss[-1],
-            'final_val_loss': val_loss[-1],
-            'final_accuracy': val_acc[-1],
-            'best_accuracy': np.max(val_acc),
-            'epochs_to_best': int(np.argmax(val_acc)),
-            'train_loss_std': np.std(train_loss[-10:]) if len(train_loss) >= 10 else 0.0,
-            'val_loss_std': np.std(val_loss[-10:]) if len(val_loss) >= 10 else 0.0,
-            'convergence_rate': (train_loss[0] - train_loss[-1]) / len(train_loss) if len(train_loss) > 0 else 0.0
+    import os
+    import torch
+
+    analysis_results = {}
+
+    # Check if we have both models for comparison
+    if 'premature' not in results or 'mature' not in results:
+        if verbose:
+            print("Skipping dynamical analysis: need both premature and mature models")
+        return analysis_results
+
+    premature_model = results['premature'].get('model')
+    mature_model = results['mature'].get('model')
+
+    if premature_model is None or mature_model is None:
+        if verbose:
+            print("Skipping dynamical analysis: models not available in results")
+        return analysis_results
+
+    if verbose:
+        print("\n" + "-" * 70)
+        print("Running Dynamical Systems Analysis")
+        print("-" * 70)
+
+    # Get test data from dataset
+    _, _, test_idx = dataset.split()
+    inputs, targets, trial_info = dataset.get_batch(len(test_idx), test_idx)
+
+    # Extract actions and rewards from trial_info
+    actions = trial_info['actions'].numpy() if isinstance(trial_info['actions'], torch.Tensor) else trial_info['actions']
+    rewards = trial_info['rewards'].numpy() if isinstance(trial_info['rewards'], torch.Tensor) else trial_info['rewards']
+
+    try:
+        # 1. Run developmental comparison analysis
+        if verbose:
+            print("  Running developmental comparison...")
+
+        comparator = DevelopmentalComparisonAnalyzer(premature_model, mature_model)
+        comparison = comparator.run_comparison(inputs, actions, rewards)
+
+        analysis_results['developmental_comparison'] = {
+            'premature_fixed_points': comparison.premature_fixed_points,
+            'mature_fixed_points': comparison.mature_fixed_points,
+            'premature_setpoints': comparison.premature_setpoints,
+            'mature_setpoints': comparison.mature_setpoints,
+            'dimensionality_premature': comparison.dimensionality_premature,
+            'dimensionality_mature': comparison.dimensionality_mature,
+            'specialization_premature': comparison.specialization_premature,
+            'specialization_mature': comparison.specialization_mature,
         }
-        
-        analysis[model_name] = model_analysis
-    
-    return analysis
+
+        # Generate comparison figure
+        fig_path = os.path.join(output_dir, 'figures', 'figure_developmental_comparison.png')
+        os.makedirs(os.path.dirname(fig_path), exist_ok=True)
+        comparator.plot_comparison(comparison, save_path=fig_path)
+
+        if verbose:
+            print(f"    Saved: {fig_path}")
+
+        # 2. Generate phase portraits for each model
+        if verbose:
+            print("  Generating phase portraits...")
+
+        for model_name in ['premature', 'mature']:
+            model = results[model_name]['model']
+            phase_gen = PhasePortraitGenerator(model)
+            phase_data = phase_gen.generate_from_data(inputs, actions, rewards)
+
+            analysis_results[f'{model_name}_phase_portrait'] = {
+                'fixed_points': phase_data.fixed_points,
+                'preference_setpoints': phase_data.preference_setpoints,
+            }
+
+            # Save phase portrait figure
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(8, 6))
+            phase_gen.plot_phase_portrait(phase_data, ax=ax,
+                                         title=f'{model_name.capitalize()} Phase Portrait')
+            fig_path = os.path.join(output_dir, 'figures', f'figure_phase_portrait_{model_name}.png')
+            fig.savefig(fig_path, dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close(fig)
+
+            if verbose:
+                print(f"    Saved: {fig_path}")
+
+        # 3. Summary
+        if verbose:
+            print("\n  Analysis Summary:")
+            print(f"    Premature dimensionality: {comparison.dimensionality_premature:.2f}")
+            print(f"    Mature dimensionality: {comparison.dimensionality_mature:.2f}")
+            print(f"    Premature specialization: {comparison.specialization_premature:.4f}")
+            print(f"    Mature specialization: {comparison.specialization_mature:.4f}")
+
+    except Exception as e:
+        if verbose:
+            print(f"  Warning: Dynamical analysis failed: {e}")
+
+    return analysis_results
 
 
 # =============================================================================
@@ -357,17 +455,6 @@ def main():
         print(f"TASK: {task_type.value.upper()}")
         print(f"{'='*70}")
         
-        # task_results = run_developmental_comparison(
-        #     task_type=task_type,
-        #     n_sessions=args.n_sessions,
-        #     trials_per_session=args.trials_per_session,
-        #     n_hidden=args.n_hidden,
-        #     n_epochs=args.n_epochs,
-        #     factorization_type=get_factorization_type(args.factorization),
-        #     cell_type=get_cell_type(args.cell_type),
-        #     seed=args.seed
-        # )
-
         task_results = run_developmental_comparison(
             task_type=task_type,
             n_sessions=args.n_sessions,
@@ -392,6 +479,25 @@ def main():
                 print(f"Figures generated: {len(fig_paths)}")
             except Exception as e:
                 print(f"Warning: Figure generation failed: {e}")
+
+            # Run dynamical systems analysis (using analysis.py functions)
+            try:
+                # Create a dataset for analysis
+                analysis_dataset = TaskDataset(
+                    task_type,
+                    n_sessions=args.n_sessions,
+                    trials_per_session=args.trials_per_session,
+                    seed=args.seed
+                )
+                dynamical_analysis = run_dynamical_analysis(
+                    task_results,
+                    analysis_dataset,
+                    args.output_dir,
+                    verbose=args.verbose
+                )
+                task_results['dynamical_analysis'] = dynamical_analysis
+            except Exception as e:
+                print(f"Warning: Dynamical analysis failed: {e}")
     
     # Generate summary report
     generate_summary_report(all_results, args.output_dir)
