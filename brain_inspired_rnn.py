@@ -1264,7 +1264,12 @@ def get_model_metrics(model: nn.Module) -> Dict:
 
         S_normalized = S / S[0] if S[0] > 0 else S
         metrics['singular_values'] = S_normalized
-        metrics['spectral_radius'] = float(np.abs(np.linalg.eigvals(W_hh.cpu().numpy())).max())
+
+        # Extract the new hidden state weights (last third of concatenated GRU weight matrix)
+        # GRU weight_hh has shape (3*hidden_dim, hidden_dim) for [reset, update, new]
+        hidden_dim = model.hidden_dim
+        W_hn = W_hh[2*hidden_dim:3*hidden_dim, :].cpu().numpy()
+        metrics['spectral_radius'] = float(np.abs(np.linalg.eigvals(W_hn)).max())
         metrics['developmental_stage'] = 'baseline'
         metrics['cell_type'] = 'gru'
 
