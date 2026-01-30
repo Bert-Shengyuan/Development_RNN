@@ -142,9 +142,14 @@ def run_dynamical_analysis(
     inputs, targets, trial_info = dataset.get_batch(len(test_idx), test_idx)
 
     # Extract actions and rewards from trial_info
-    actions = trial_info['actions'].numpy() if isinstance(trial_info['actions'], torch.Tensor) else trial_info['actions']
-    rewards = trial_info['rewards'].numpy() if isinstance(trial_info['rewards'], torch.Tensor) else trial_info['rewards']
+    # actions = trial_info['actions'].numpy() if isinstance(trial_info['actions'], torch.Tensor) else trial_info['actions']
+    # rewards = trial_info['rewards'].numpy() if isinstance(trial_info['rewards'], torch.Tensor) else trial_info['rewards']
+    actions_list = [t.actions for t in trial_info]
+    rewards_list = [t.rewards for t in trial_info]
 
+    # Stack them into a single array (Shape: [Batch_Size, Time_Steps])
+    actions = np.vstack(actions_list)
+    rewards = np.vstack(rewards_list)
     try:
         # 1. Run developmental comparison analysis
         if verbose:
@@ -241,7 +246,7 @@ Examples:
     parser.add_argument('--n_sessions', type=int, default=80,
                         help='Number of training sessions (default: 80)')
     
-    parser.add_argument('--trials_per_session', type=int, default=150,
+    parser.add_argument('--trials_per_session', type=int, default=60,
                         help='Trials per session (default: 150)')
     
     parser.add_argument('--n_hidden', type=int, default=32,
