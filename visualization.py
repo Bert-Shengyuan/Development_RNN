@@ -1346,6 +1346,625 @@ def create_statistical_comparison_figure(
 
 
 # =============================================================================
+# Phase Portrait Statistical Analysis
+# =============================================================================
+
+def extract_phase_portrait_data(
+    model: nn.Module,
+    inputs: torch.Tensor,
+    actions: np.ndarray,
+    rewards: np.ndarray
+) -> Dict[int, Dict[str, np.ndarray]]:
+    """
+    Extract phase portrait trajectory data for each condition.
+
+    Computes logits L(t) and logit changes ΔL(t) for each action-reward
+    condition, organizing data for statistical analysis.
+
+    Parameters
+    ----------
+    model : nn.Module
+        Trained RNN model
+    inputs : torch.Tensor
+        Input tensor [batch, seq_len, input_dim]
+    actions : np.ndarray
+        Action sequence [batch, seq_len]
+    rewards : np.ndarray
+        Reward sequence [batch, seq_len]
+
+    Returns
+    -------
+    Dict[int, Dict[str, np.ndarray]]
+        Dictionary mapping condition index to {'L': logits, 'dL': changes}
+    """
+    model.eval()
+
+    with torch.no_grad():
+        outputs, _ = model(inputs)
+
+    # Compute logits: L(t) = output_1 - output_2
+    logits = (outputs[:, :, 0] - outputs[:, :, 1]).cpu().numpy()
+
+    # Compute logit changes
+    logit_changes = np.zeros_like(logits)
+    logit_changes[:, :-1] = logits[:, 1:] - logits[:, :-1]
+
+    # Flatten
+    logits_flat = logits.flatten()
+    logit_changes_flat = logit_changes.flatten()
+    actions_flat = actions.flatten()
+    rewards_flat = rewards.flatten()
+
+    # Compute input conditions: 2*action + reward
+    conditions = 2 * actions_flat + rewards_flat
+
+    # Organize by condition
+    condition_data = {}
+    for cond in np.unique(conditions):
+        mask = conditions == cond
+        condition_data[int(cond)] = {
+            'L': logits_flat[mask],
+            'dL': logit_changes_flat[mask],
+            'action': int(cond // 2),
+            'reward': int(cond % 2)
+        }
+
+    return condition_data
+
+
+def find_fixed_points(
+    L: np.ndarray,
+    dL: np.ndarray,
+    method: str = 'interpolation',
+    n_smooth: int = 20
+) -> List[float]:
+    """
+    Find fixed points (where ΔL = 0) from phase portrait trajectories.
+
+    Fixed points are attractors in the phase space where the logit
+    change becomes zero, indicating stable decision states.
+
+    Parameters
+    ----------
+    L : np.ndarray
+        Logit values
+    dL : np.ndarray
+        Logit change values
+    method : str
+        Method for finding fixed points ('interpolation', 'zero_crossing')
+    n_smooth : int
+        Number of points for smoothing
+
+    Returns
+    -------
+    List[float]
+        List of L values where fixed points occur
+    """
+    if len(L) < n_smooth:
+        return []
+
+    # Sort by L for smoothing
+    sort_idx = np.argsort(L)
+    L_sorted = L[sort_idx]
+    dL_sorted = dL[sort_idx]
+
+    # Smooth the trajectory
+    if len(L_sorted) > n_smooth:
+        window = max(len(L_sorted) // n_smooth, 3)
+        L_smooth = np.convolve(L_sorted, np.ones(window)/window, mode='valid')
+        dL_smooth = np.convolve(dL_sorted, np.ones(window)/window, mode='valid')
+    else:
+        L_smooth = L_sorted
+        dL_smooth = dL_sorted
+
+    # Find zero crossings
+    fixed_points = []
+
+    if method == 'zero_crossing':
+        for i in range(len(dL_smooth) - 1):
+            if dL_smooth[i] * dL_smooth[i+1] < 0:  # Sign change
+                # Linear interpolation to find exact crossing
+                L_fp = L_smooth[i] + (L_smooth[i+1] - L_smooth[i]) * \
+                       (-dL_smooth[i] / (dL_smooth[i+1] - dL_smooth[i]))
+                fixed_points.append(L_fp)
+
+    elif method == 'interpolation':
+        # Find where |dL| is minimum (closest to zero)
+        zero_crossings = np.where(np.diff(np.sign(dL_smooth)))[0]
+        for idx in zero_crossings:
+            if idx < len(L_smooth) - 1:
+                # Interpolate to find exact zero
+                L_fp = L_smooth[idx] + (L_smooth[idx+1] - L_smooth[idx]) * \
+                       (-dL_smooth[idx] / (dL_smooth[idx+1] - dL_smooth[idx] + 1e-10))
+                fixed_points.append(L_fp)
+
+    return fixed_points
+
+
+def compute_trajectory_metrics(
+    L: np.ndarray,
+    dL: np.ndarray
+) -> Dict[str, float]:
+    """
+    Compute statistical metrics for a phase portrait trajectory.
+
+    Metrics:
+    - stability: Variance of points around smoothed trajectory
+    - curvature: Mean absolute second derivative (trajectory curvature)
+    - slope: Mean slope of trajectory
+    - range: Range of L values covered
+    - convergence_rate: How quickly ΔL approaches zero
+
+    Parameters
+    ----------
+    L : np.ndarray
+        Logit values
+    dL : np.ndarray
+        Logit change values
+
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary of trajectory metrics
+    """
+    if len(L) < 10:
+        return {
+            'stability': np.nan,
+            'curvature': np.nan,
+            'slope': np.nan,
+            'range': np.nan,
+            'convergence_rate': np.nan
+        }
+
+    # Sort by L
+    sort_idx = np.argsort(L)
+    L_sorted = L[sort_idx]
+    dL_sorted = dL[sort_idx]
+
+    # 1. Stability: variance around smoothed trajectory
+    window = max(len(L) // 20, 3)
+    if len(L_sorted) > window:
+        dL_smooth = np.convolve(dL_sorted, np.ones(window)/window, mode='valid')
+        # Compute variance of residuals
+        residuals = dL_sorted[window//2:-(window//2+window%2)] - dL_smooth
+        stability = np.var(residuals)
+    else:
+        stability = np.var(dL_sorted)
+
+    # 2. Curvature: mean absolute second derivative
+    if len(dL_sorted) > 2:
+        second_deriv = np.diff(dL_sorted, n=2)
+        curvature = np.mean(np.abs(second_deriv))
+    else:
+        curvature = 0.0
+
+    # 3. Slope: mean first derivative
+    if len(dL_sorted) > 1:
+        first_deriv = np.diff(dL_sorted) / (np.diff(L_sorted) + 1e-10)
+        slope = np.mean(first_deriv)
+    else:
+        slope = 0.0
+
+    # 4. Range
+    L_range = np.max(L) - np.min(L)
+
+    # 5. Convergence rate: how quickly |dL| decreases
+    # Fit exponential decay to |dL| vs time
+    abs_dL = np.abs(dL_sorted)
+    if len(abs_dL) > 5 and np.max(abs_dL) > 1e-6:
+        # Use first half vs second half as simple metric
+        first_half = np.mean(abs_dL[:len(abs_dL)//2])
+        second_half = np.mean(abs_dL[len(abs_dL)//2:])
+        convergence_rate = (first_half - second_half) / (first_half + 1e-10)
+    else:
+        convergence_rate = 0.0
+
+    return {
+        'stability': stability,
+        'curvature': curvature,
+        'slope': slope,
+        'range': L_range,
+        'convergence_rate': convergence_rate
+    }
+
+
+def compare_phase_portraits(
+    premature_data: Dict[int, Dict[str, np.ndarray]],
+    mature_data: Dict[int, Dict[str, np.ndarray]]
+) -> Dict[str, Dict]:
+    """
+    Statistically compare phase portraits between premature and mature networks.
+
+    Compares:
+    1. Fixed point locations for each condition
+    2. Trajectory stability (variance)
+    3. Trajectory curvature
+    4. Condition separability
+
+    Parameters
+    ----------
+    premature_data : Dict
+        Phase portrait data from premature network
+    mature_data : Dict
+        Phase portrait data from mature network
+
+    Returns
+    -------
+    Dict[str, Dict]
+        Comparison statistics for each metric
+    """
+    comparison = {
+        'fixed_points': {},
+        'trajectory_metrics': {},
+        'condition_separation': {}
+    }
+
+    # Compare fixed points for each condition
+    for cond in premature_data.keys():
+        if cond not in mature_data:
+            continue
+
+        prem_L = premature_data[cond]['L']
+        prem_dL = premature_data[cond]['dL']
+        mat_L = mature_data[cond]['L']
+        mat_dL = mature_data[cond]['dL']
+
+        # Find fixed points
+        prem_fps = find_fixed_points(prem_L, prem_dL)
+        mat_fps = find_fixed_points(mat_L, mat_dL)
+
+        action = premature_data[cond]['action']
+        reward = premature_data[cond]['reward']
+        label = f'A{action+1}_R{reward}'
+
+        comparison['fixed_points'][label] = {
+            'premature': prem_fps,
+            'mature': mat_fps,
+            'n_premature': len(prem_fps),
+            'n_mature': len(mat_fps)
+        }
+
+        # Compute trajectory metrics
+        prem_metrics = compute_trajectory_metrics(prem_L, prem_dL)
+        mat_metrics = compute_trajectory_metrics(mat_L, mat_dL)
+
+        comparison['trajectory_metrics'][label] = {
+            'premature': prem_metrics,
+            'mature': mat_metrics
+        }
+
+    # Compute overall condition separation
+    # (mean pairwise distance between condition centroids)
+    prem_centroids = []
+    mat_centroids = []
+
+    for cond in premature_data.keys():
+        if cond in mature_data:
+            prem_centroids.append([
+                np.mean(premature_data[cond]['L']),
+                np.mean(premature_data[cond]['dL'])
+            ])
+            mat_centroids.append([
+                np.mean(mature_data[cond]['L']),
+                np.mean(mature_data[cond]['dL'])
+            ])
+
+    if len(prem_centroids) > 1:
+        prem_centroids = np.array(prem_centroids)
+        mat_centroids = np.array(mat_centroids)
+
+        # Mean pairwise distance
+        from scipy.spatial.distance import pdist
+        prem_sep = np.mean(pdist(prem_centroids))
+        mat_sep = np.mean(pdist(mat_centroids))
+
+        comparison['condition_separation'] = {
+            'premature': prem_sep,
+            'mature': mat_sep,
+            'difference': mat_sep - prem_sep,
+            'ratio': mat_sep / (prem_sep + 1e-10)
+        }
+
+    return comparison
+
+
+def plot_phase_portrait_comparison(
+    premature_model: nn.Module,
+    mature_model: nn.Module,
+    inputs: torch.Tensor,
+    actions: np.ndarray,
+    rewards: np.ndarray,
+    figsize: Tuple[float, float] = (16, 12)
+) -> plt.Figure:
+    """
+    Create side-by-side phase portrait comparison with statistical annotations.
+
+    Parameters
+    ----------
+    premature_model : nn.Module
+        Trained premature RNN model
+    mature_model : nn.Module
+        Trained mature RNN model
+    inputs : torch.Tensor
+        Input tensor for evaluation
+    actions : np.ndarray
+        Action sequence
+    rewards : np.ndarray
+        Reward sequence
+    figsize : Tuple
+        Figure size
+
+    Returns
+    -------
+    plt.Figure
+        Matplotlib figure object
+    """
+    fig = plt.figure(figsize=figsize)
+    gs = gridspec.GridSpec(3, 2, height_ratios=[1.5, 1, 0.8],
+                          hspace=0.35, wspace=0.3)
+
+    # Extract phase portrait data
+    prem_data = extract_phase_portrait_data(premature_model, inputs, actions, rewards)
+    mat_data = extract_phase_portrait_data(mature_model, inputs, actions, rewards)
+
+    # Compare
+    comparison = compare_phase_portraits(prem_data, mat_data)
+
+    # A. Premature phase portrait
+    ax_prem = fig.add_subplot(gs[0, 0])
+    plot_phase_portrait(premature_model, inputs, actions, rewards,
+                       ax=ax_prem, title='Premature Network')
+
+    # B. Mature phase portrait
+    ax_mat = fig.add_subplot(gs[0, 1])
+    plot_phase_portrait(mature_model, inputs, actions, rewards,
+                       ax=ax_mat, title='Mature Network')
+
+    # C. Fixed point comparison
+    ax_fp = fig.add_subplot(gs[1, 0])
+    plot_fixed_point_comparison(comparison, ax=ax_fp)
+
+    # D. Trajectory metrics comparison
+    ax_traj = fig.add_subplot(gs[1, 1])
+    plot_trajectory_metrics_comparison(comparison, ax=ax_traj)
+
+    # E. Statistical summary table
+    ax_summary = fig.add_subplot(gs[2, :])
+    plot_phase_portrait_summary(comparison, ax=ax_summary)
+
+    plt.suptitle('Phase Portrait Statistical Comparison: Premature vs Mature',
+                fontsize=15, fontweight='bold', y=0.98)
+
+    return fig
+
+
+def plot_fixed_point_comparison(
+    comparison: Dict,
+    ax: plt.Axes = None
+) -> plt.Axes:
+    """
+    Plot fixed point locations comparison across conditions.
+
+    Parameters
+    ----------
+    comparison : Dict
+        Comparison statistics from compare_phase_portraits
+    ax : plt.Axes, optional
+        Matplotlib axes
+
+    Returns
+    -------
+    plt.Axes
+        Matplotlib axes object
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+    fps = comparison['fixed_points']
+
+    if not fps:
+        ax.text(0.5, 0.5, 'No fixed points detected',
+               ha='center', va='center', transform=ax.transAxes)
+        return ax
+
+    conditions = list(fps.keys())
+    x = np.arange(len(conditions))
+
+    # Plot fixed point locations
+    for i, cond in enumerate(conditions):
+        prem_fps = fps[cond]['premature']
+        mat_fps = fps[cond]['mature']
+
+        # Plot as scatter
+        if prem_fps:
+            ax.scatter([i] * len(prem_fps), prem_fps,
+                      color=COLORS['premature'], s=100, alpha=0.7,
+                      marker='o', label='Premature' if i == 0 else '')
+
+        if mat_fps:
+            ax.scatter([i] * len(mat_fps), mat_fps,
+                      color=COLORS['mature'], s=100, alpha=0.7,
+                      marker='s', label='Mature' if i == 0 else '')
+
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5, label='Neutral')
+    ax.set_xticks(x)
+    ax.set_xticklabels(conditions, rotation=15, ha='right')
+    ax.set_xlabel('Condition')
+    ax.set_ylabel('Fixed Point Location $L^*$')
+    ax.set_title('Fixed Point Comparison Across Conditions', fontweight='bold')
+    ax.legend(loc='best')
+    ax.grid(axis='y', alpha=0.3)
+
+    return ax
+
+
+def plot_trajectory_metrics_comparison(
+    comparison: Dict,
+    ax: plt.Axes = None,
+    metric: str = 'stability'
+) -> plt.Axes:
+    """
+    Plot trajectory metrics comparison.
+
+    Parameters
+    ----------
+    comparison : Dict
+        Comparison statistics
+    ax : plt.Axes, optional
+        Matplotlib axes
+    metric : str
+        Metric to plot ('stability', 'curvature', 'slope', etc.)
+
+    Returns
+    -------
+    plt.Axes
+        Matplotlib axes object
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+    traj_metrics = comparison['trajectory_metrics']
+
+    if not traj_metrics:
+        ax.text(0.5, 0.5, 'No trajectory metrics available',
+               ha='center', va='center', transform=ax.transAxes)
+        return ax
+
+    conditions = list(traj_metrics.keys())
+    x = np.arange(len(conditions))
+    width = 0.35
+
+    prem_values = []
+    mat_values = []
+
+    for cond in conditions:
+        prem_val = traj_metrics[cond]['premature'].get(metric, np.nan)
+        mat_val = traj_metrics[cond]['mature'].get(metric, np.nan)
+        prem_values.append(prem_val)
+        mat_values.append(mat_val)
+
+    bars1 = ax.bar(x - width/2, prem_values, width,
+                   label='Premature', color=COLORS['premature'],
+                   edgecolor='black', linewidth=1.2)
+    bars2 = ax.bar(x + width/2, mat_values, width,
+                   label='Mature', color=COLORS['mature'],
+                   edgecolor='black', linewidth=1.2)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(conditions, rotation=15, ha='right')
+    ax.set_xlabel('Condition')
+    ax.set_ylabel(metric.replace('_', ' ').title())
+    ax.set_title(f'Trajectory {metric.replace("_", " ").title()} Comparison',
+                fontweight='bold')
+    ax.legend(loc='best')
+    ax.grid(axis='y', alpha=0.3)
+
+    return ax
+
+
+def plot_phase_portrait_summary(
+    comparison: Dict,
+    ax: plt.Axes = None
+) -> plt.Axes:
+    """
+    Create summary table for phase portrait comparison.
+
+    Parameters
+    ----------
+    comparison : Dict
+        Comparison statistics
+    ax : plt.Axes, optional
+        Matplotlib axes
+
+    Returns
+    -------
+    plt.Axes
+        Matplotlib axes object
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 4))
+
+    ax.axis('off')
+
+    # Aggregate metrics across conditions
+    traj_metrics = comparison['trajectory_metrics']
+
+    # Compute averages
+    avg_prem_stability = []
+    avg_mat_stability = []
+    avg_prem_curvature = []
+    avg_mat_curvature = []
+
+    for cond, metrics in traj_metrics.items():
+        prem = metrics['premature']
+        mat = metrics['mature']
+
+        if not np.isnan(prem['stability']):
+            avg_prem_stability.append(prem['stability'])
+        if not np.isnan(mat['stability']):
+            avg_mat_stability.append(mat['stability'])
+        if not np.isnan(prem['curvature']):
+            avg_prem_curvature.append(prem['curvature'])
+        if not np.isnan(mat['curvature']):
+            avg_mat_curvature.append(mat['curvature'])
+
+    # Create table
+    columns = ['Metric', 'Premature', 'Mature', 'Δ', 'Interpretation']
+    rows = []
+
+    # Stability
+    if avg_prem_stability and avg_mat_stability:
+        prem_stab = np.mean(avg_prem_stability)
+        mat_stab = np.mean(avg_mat_stability)
+        diff_stab = mat_stab - prem_stab
+        interp = 'More stable' if diff_stab < 0 else 'Less stable'
+        rows.append(['Trajectory Stability', f'{prem_stab:.4f}', f'{mat_stab:.4f}',
+                    f'{diff_stab:+.4f}', interp])
+
+    # Curvature
+    if avg_prem_curvature and avg_mat_curvature:
+        prem_curv = np.mean(avg_prem_curvature)
+        mat_curv = np.mean(avg_mat_curvature)
+        diff_curv = mat_curv - prem_curv
+        interp = 'More curved' if diff_curv > 0 else 'More linear'
+        rows.append(['Trajectory Curvature', f'{prem_curv:.4f}', f'{mat_curv:.4f}',
+                    f'{diff_curv:+.4f}', interp])
+
+    # Condition separation
+    if 'condition_separation' in comparison and comparison['condition_separation']:
+        sep = comparison['condition_separation']
+        prem_sep = sep['premature']
+        mat_sep = sep['mature']
+        diff_sep = sep['difference']
+        interp = 'Better separated' if diff_sep > 0 else 'Less separated'
+        rows.append(['Condition Separation', f'{prem_sep:.3f}', f'{mat_sep:.3f}',
+                    f'{diff_sep:+.3f}', interp])
+
+    if rows:
+        table = ax.table(cellText=rows, colLabels=columns,
+                        loc='center', cellLoc='center',
+                        colColours=['#E8E8E8']*5)
+
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1.2, 2.0)
+
+        # Style header
+        for i in range(len(columns)):
+            cell = table[(0, i)]
+            cell.set_text_props(fontweight='bold')
+            cell.set_facecolor('#D0D0D0')
+
+        ax.set_title('Phase Portrait Statistical Summary',
+                    fontsize=12, fontweight='bold', pad=20)
+    else:
+        ax.text(0.5, 0.5, 'No summary statistics available',
+               ha='center', va='center', transform=ax.transAxes)
+
+    return ax
+
+
+# =============================================================================
 # Summary Statistics Table
 # =============================================================================
 
